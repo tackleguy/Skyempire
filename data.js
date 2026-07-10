@@ -112,6 +112,30 @@ const AIRCRAFT = [
 const AC = {}; AIRCRAFT.forEach(a=>AC[a.model]=a);
 const BELLY = {Widebody:12,Large:15,Jumbo:18};
 
+// On-board service tiers (AirlineSim-style service profiles)
+const SVC = [
+ {name:"No Frills",cost:0,pts:0,minKm:0},
+ {name:"Snacks & Drinks",cost:4,pts:10,minKm:0},
+ {name:"Full Meal",cost:9,pts:18,minKm:800},
+ {name:"Gourmet",cost:16,pts:25,minKm:1500}
+];
+// Maintenance category family per model (first 3 families free, +15% maint each extra)
+function FAMILY(model){
+  if(model.startsWith("ATR"))return "ATR";
+  if(model.startsWith("CRJ"))return "CRJ";
+  if(model.startsWith("E1"))return "E-Jet";
+  if(model.startsWith("A220"))return "A220";
+  if(model.startsWith("A32"))return "A320";
+  if(model.startsWith("737"))return "737";
+  if(model.startsWith("767"))return "767";
+  if(model.startsWith("787"))return "787";
+  if(model.startsWith("A330"))return "A330";
+  if(model.startsWith("A350"))return "A350";
+  if(model.startsWith("777"))return "777";
+  if(model.startsWith("747"))return "747";
+  return model;
+}
+
 const LEVELS = [0,75e6,150e6,300e6,600e6,1.2e9,2.5e9,5e9,10e9,20e9]; // net worth threshold for level i+1
 
 const RIVALS = [

@@ -38,6 +38,29 @@ function crewRate(ac){
   return ["Widebody","Large","Jumbo"].includes(ac.cls)?2600:1400;
 }
 const isWide = ac => ["Widebody","Large","Jumbo"].includes(ac.cls);
+function fleetFamilies(){ return new Set(S.fleet.map(a=>FAMILY(a.model))).size; }
+function maintSurcharge(){ return Math.max(0,fleetFamilies()-3)*0.15; }
+function effSvcTier(r,dist){ let t=r.svc||0; while(t>0&&dist<SVC[t].minKm)t--; return t; }
+// Flight Rating System: 0–100 from price, service, comfort, condition
+function routeRating(r,acObj){
+  const spec=AC[r.acModel];
+  const dist=distKm(r.from,r.to);
+  const cond=acObj?acObj.condition:100;
+  let pts=50+(1.25-r.m)*40+(cond-75)*0.4;
+  if(spec.classic)pts-=8;
+  if(r.type==="pax"){
+    pts+=SVC[effSvcTier(r,dist)].pts-(dist>3000?12:dist>800?6:2);
+    if(acObj){const c=seatCfg(acObj);pts+=Math.min(10,(c.b*3+c.p*1.5)/Math.max(1,spec.cap)*40);}
+    if(isWide(spec)&&dist>7000)pts+=5;
+  }
+  return clamp(Math.round(pts),0,100);
+}
+function rivalNetwork(name){
+  const rv=RIVALS.find(r=>r.name===name);
+  const set=new Set([rv.base]);
+  rv.routes.concat(S.rivalExtra.filter(x=>x.airline===name).map(x=>x.pair)).forEach(p=>{set.add(p[0]);set.add(p[1]);});
+  return set;
+}
 
 // ---------- State ----------
 let S = null; // game state
@@ -51,10 +74,10 @@ function defaultState(){
     hubs:[], mainHub:null,
     fleet:[], nextAcId:1,
     routes:[], nextRouteId:1, flights:[],
-    loans:[], globalMkt:false,
+    loans:[], globalMkt:false, image:50, interline:{},
     livery:{base:"#4DA3FF",accent:"#E8EEF9",tail:"#4DA3FF",pattern:"cheatline",logo:"bird",},
     level:1, ach:{}, stats:{pax:0,tonnes:0,profitStreak:0},
-    today:{rev:0,revPax:0,revCargo:0,revBelly:0,fuel:0,crew:0,fees:0,maint:0,lease:0,overhead:0,marketing:0,interest:0,other:0},
+    today:{rev:0,revPax:0,revCargo:0,revBelly:0,fuel:0,crew:0,fees:0,maint:0,lease:0,overhead:0,marketing:0,interest:0,svc:0,interline:0,other:0},
     pnl:[], usedRolls:{},
     events:{viralRoute:null,viralUntil:0,storm:null,stormDay:0},
     rivalExtra:[], nextRivalDay:10,
@@ -80,6 +103,12 @@ function routeDemandMult(r){
   if(r.marketing) m*=1.12;
   if(S.globalMkt) m*=1.05;
   if(S.events.viralRoute===r.id && S.day<=S.events.viralUntil) m*=1.8;
+  m*=0.9+(S.image||50)/100*0.2; // airline image: 0.9–1.1
+  for(const name in S.interline){
+    if(!S.interline[name])continue;
+    const net=rivalNetwork(name);
+    if(net.has(r.from)||net.has(r.to)) m*=1.10;
+  }
   return m;
 }
 // per-leg economics; r may be a hypothetical route {type,from,to,acModel,freq,m,marketing}; acObj optional live aircraft
@@ -88,9 +117,10 @@ function legEcon(r, dir, acObj, opts={}){
   const from=dir===0?r.from:r.to, to=dir===0?r.to:r.from;
   const dist=distKm(r.from,r.to);
   const fh=flightHours(dist,spec.speed);
-  const loadShare=clamp(1.45-0.6*r.m,0.25,1.0);
+  const rating=routeRating(r,acObj);
+  const loadShare=clamp(clamp(1.45-0.6*r.m,0.25,1.0)*(0.75+rating/100*0.5),0.15,1.0);
   const dm=routeDemandMult(r);
-  const res={rev:0,revPax:0,revCargo:0,revBelly:0,fuel:0,crew:0,fee:0,maint:0,pax:{e:0,p:0,b:0},tonnes:0,belly:0,fh,dist,seats:0,cap:0};
+  const res={rev:0,revPax:0,revCargo:0,revBelly:0,fuel:0,crew:0,fee:0,maint:0,svc:0,pax:{e:0,p:0,b:0},tonnes:0,belly:0,fh,dist,seats:0,cap:0,rating};
   if(r.type==="pax"){
     const pool=Math.min(TIERS[AP[r.from].tier].pool,TIERS[AP[r.to].tier].pool)*falloff(dist)*famousMult(r.from,r.to)*WD_MULT(S.day)*dm;
     const cfg=acObj?seatCfg(acObj):{b:0,p:0,e:spec.cap};
@@ -124,15 +154,17 @@ function legEcon(r, dir, acObj, opts={}){
   res.crew=crewRate(spec)*fh;
   res.fee=TIERS[AP[to].tier].landing;
   const cond=acObj?acObj.condition:100;
-  res.maint=spec.maint*fh*(cond<70?2:1);
-  res.cost=res.fuel+res.crew+res.fee+res.maint;
+  res.maint=spec.maint*fh*(cond<70?2:1)*(1+maintSurcharge());
+  if(r.type==="pax")res.svc=SVC[effSvcTier(r,dist)].cost*(res.pax.e+1.5*res.pax.p+3*res.pax.b);
+  res.cost=res.fuel+res.crew+res.fee+res.maint+res.svc;
   res.profit=res.rev-res.cost;
   return res;
 }
 function dailyEcon(r,acObj){ // both directions × freq
   const a=legEcon(r,0,acObj), b=legEcon(r,1,acObj);
   const sum={};
-  for(const k of ["rev","revPax","revCargo","revBelly","fuel","crew","fee","maint","cost","profit"]) sum[k]=(a[k]+b[k])*r.freq;
+  for(const k of ["rev","revPax","revCargo","revBelly","fuel","crew","fee","maint","svc","cost","profit"]) sum[k]=(a[k]+b[k])*r.freq;
+  sum.rating=Math.round((a.rating+b.rating)/2);
   sum.pax=(a.pax.e+a.pax.p+a.pax.b+b.pax.e+b.pax.p+b.pax.b)*r.freq;
   sum.tonnes=(a.tonnes+b.tonnes)*r.freq;
   sum.load=r.type==="pax"?sum.pax/((a.seats+b.seats)*r.freq||1):sum.tonnes/((a.cap+b.cap)*r.freq||1);
@@ -440,6 +472,8 @@ function landFlight(f){
   S.today.revPax+=e.revPax; S.today.revCargo+=e.revCargo; S.today.revBelly+=e.revBelly;
   S.today.fuel+=e.fuel*(rev===0?0.5:1); S.today.crew+=e.crew*(rev===0?0.5:1);
   S.today.fees+=e.fee*(rev===0?0.5:1); S.today.maint+=e.maint*(rev===0?0.5:1);
+  S.today.svc+=e.svc*(rev===0?0.5:1);
+  S.image=clamp((S.image||50)+(e.rating-(S.image||50))*0.02,0,100);
   r.profitToday=(r.profitToday||0)+rev-cost;
   r.bellyUsedToday=(r.bellyUsedToday||0)+e.belly;
   const paxN=e.pax.e+e.pax.p+e.pax.b;
@@ -460,7 +494,7 @@ function landFlight(f){
 function midnight(newDay){
   // post P&L for S.day
   const t=S.today;
-  const costs=t.fuel+t.crew+t.fees+t.maint+t.lease+t.overhead+t.marketing+t.interest+t.other;
+  const costs=t.fuel+t.crew+t.fees+t.maint+t.lease+t.overhead+t.marketing+t.interest+(t.svc||0)+(t.interline||0)+t.other;
   const net=t.rev-costs;
   S.pnl.push({day:S.day,net,...t,costs});
   if(S.pnl.length>60)S.pnl.shift();
@@ -478,7 +512,7 @@ function midnight(newDay){
     if((a.status==="grounded"||a.status==="charter")&&newDay>=a.statusUntil){a.status="ok";}
   }
   S.day=newDay;
-  S.today={rev:0,revPax:0,revCargo:0,revBelly:0,fuel:0,crew:0,fees:0,maint:0,lease:0,overhead:0,marketing:0,interest:0,other:0};
+  S.today={rev:0,revPax:0,revCargo:0,revBelly:0,fuel:0,crew:0,fees:0,maint:0,lease:0,overhead:0,marketing:0,interest:0,svc:0,interline:0,other:0};
   // fuel walk
   S.fuelIdx=clamp(S.fuelIdx*(1+rand(-0.02,0.02)),0.75,1.45);
   S.fuelHist.push(effFuelIdx()); if(S.fuelHist.length>30)S.fuelHist.shift();
@@ -491,6 +525,8 @@ function midnight(newDay){
   S.today.lease+=lease; S.cash-=lease;
   let mkt=S.routes.filter(r=>r.marketing).length*25e3+(S.globalMkt?150e3:0);
   S.today.marketing+=mkt; S.cash-=mkt;
+  let ilFee=Object.values(S.interline).filter(Boolean).length*10e3;
+  S.today.interline+=ilFee; S.cash-=ilFee;
   let interest=S.loans.reduce((s,l)=>s+l.amount*0.0003,0);
   S.today.interest+=interest; S.cash-=interest;
   // used market rolls
@@ -590,9 +626,10 @@ function loop(now){
 function renderTopbar(){
   $("#tbCash").textContent=fmtMoney(S.cash);
   const t=S.today;
-  const net=t.rev-(t.fuel+t.crew+t.fees+t.maint+t.lease+t.overhead+t.marketing+t.interest+t.other);
+  const net=t.rev-(t.fuel+t.crew+t.fees+t.maint+t.lease+t.overhead+t.marketing+t.interest+(t.svc||0)+(t.interline||0)+t.other);
   $("#tbPnl").innerHTML=`Today <span class="${net>=0?"pos":"neg"}">${fmtMoney(net)}</span>`;
   $("#tbFuel").innerHTML=`⛽ ${effFuelIdx().toFixed(2)}${S.day<=S.spikeUntil?" 🔺":""}`;
+  $("#tbImg").innerHTML=`⭐ ${Math.round(S.image||50)}`;
   const day=S.day, min=Math.floor(S.t%1440);
   $("#tbClock").textContent=`${DAYS[weekday(day)]} · Day ${day} · ${String(Math.floor(min/60)).padStart(2,"0")}:${String(min%60).padStart(2,"0")}`;
 }
@@ -690,7 +727,10 @@ function renderFleet(){
         <button class="btn sm danger" onclick="sellAc(${a.id})">${a.leased?"Return":"Sell "+fmtMoney(sellVal)}</button>
       </div></div>`;
   }).join("");
-  el.innerHTML=`<div class="inner"><div class="spread mb"><h1 style="margin:0">Fleet</h1><button class="btn primary" onclick="openBuyModal()">Buy Aircraft</button></div>
+  const fam=fleetFamilies(), sur=maintSurcharge();
+  el.innerHTML=`<div class="inner"><div class="spread mb"><h1 style="margin:0">Fleet</h1>
+    <div class="row"><span class="chip" title="Distinct aircraft families — first 3 are free, each extra adds +15% maintenance fleet-wide">🔧 ${fam} maint. ${fam===1?"family":"families"}${sur>0?` · <span class="neg">+${Math.round(sur*100)}% maint</span>`:" (3 free)"}</span>
+    <button class="btn primary" onclick="openBuyModal()">Buy Aircraft</button></div></div>
     ${S.fleet.length?`<div class="grid3">${cards}</div>`:`<div class="card">No aircraft yet. Buy your first plane to get started.</div>`}</div>`;
 }
 window.doOverhaul=function(id){
@@ -802,6 +842,7 @@ function renderRoutes(){
       <td>${ac?esc(ac.model):"—"}</td>
       <td>${r.freq}/day</td>
       <td>×${r.m.toFixed(2)}</td>
+      <td><span style="color:${d&&d.rating>=65?"var(--ok)":d&&d.rating>=40?"var(--warn)":"var(--bad)"}">★ ${d?d.rating:"—"}</span>${r.type==="pax"?`<br><span class="sub">${SVC[effSvcTier(r,distKm(r.from,r.to))].name}</span>`:""}</td>
       <td>${Math.round(avgLoad*100)}%</td>
       <td class="${d&&d.profit>=0?"pos":"neg"}">${d?fmtMoney(d.profit):"—"}${d&&d.revBelly?`<br><span class="sub">incl. belly ${fmtMoney(d.revBelly)}</span>`:""}</td>
       <td>${r.marketing?'<span class="badge ok">MKT</span>':""}${S.events.viralRoute===r.id&&S.day<=S.events.viralUntil?'<span class="badge warn">🔥</span>':""}</td>
@@ -813,7 +854,7 @@ function renderRoutes(){
         <button class="btn ${S.globalMkt?"primary":""}" onclick="toggleGlobalMkt()">${S.globalMkt?"✓ ":""}Brand Campaign $150K/day</button>
         <button class="btn primary" onclick="openRouteWizard()">New Route</button>
       </div></div>
-    ${S.routes.length?`<div class="card" style="padding:0 8px"><table><thead><tr><th></th><th>Route</th><th>Aircraft</th><th>Freq</th><th>Price</th><th>Load (7d)</th><th>Daily profit</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`:
+    ${S.routes.length?`<div class="card" style="padding:0 8px"><table><thead><tr><th></th><th>Route</th><th>Aircraft</th><th>Freq</th><th>Price</th><th>Rating</th><th>Load (7d)</th><th>Daily profit</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`:
     `<div class="card">No routes yet. Open your first route to start earning.</div>`}</div>`;
 }
 window.toggleGlobalMkt=function(){S.globalMkt=!S.globalMkt;toast("Brand campaign",S.globalMkt?"Active: +5% demand on all routes":"Stopped");renderRoutes();save();};
@@ -832,37 +873,49 @@ window.deleteRoute=function(id,silent){
 window.editRoute=function(id){
   const r=routeById(id);
   const spec=AC[r.acModel];
-  const cap=freqCap(flightHours(distKm(r.from,r.to),spec.speed));
+  const dist=distKm(r.from,r.to);
+  const cap=freqCap(flightHours(dist,spec.speed));
   openModal(`<h2>Edit ${r.from}–${r.to}</h2>
     <div class="field"><label>Frequency: <b id="erFv">${r.freq}</b>/day (max ${cap})</label><input type="range" id="erF" min="1" max="${cap}" value="${r.freq}"></div>
     <div class="field"><label>Price multiplier: ×<b id="erMv">${r.m.toFixed(2)}</b></label><input type="range" id="erM" min="0.5" max="2" step="0.05" value="${r.m}"></div>
+    ${r.type==="pax"?`<div class="field"><label>On-board service</label><div class="row" id="erSvc">${svcButtonsHTML(r.svc||0,dist)}</div></div>`:""}
     <div class="field"><label><input type="checkbox" id="erMkt" ${r.marketing?"checked":""} style="width:auto"> Route marketing campaign ($25K/day, +12% demand)</label></div>
     <div class="preview" id="erPrev"></div>
     <div class="row" style="margin-top:16px"><button class="btn primary" id="erOk">Save</button><button class="btn" onclick="closeModal()">Cancel</button></div>`);
+  let svcSel=r.svc||0;
   const upd=()=>{
-    const test={...r,freq:+$("#erF").value,m:+$("#erM").value,marketing:$("#erMkt").checked};
+    const test={...r,freq:+$("#erF").value,m:+$("#erM").value,marketing:$("#erMkt").checked,svc:svcSel};
     $("#erFv").textContent=test.freq;$("#erMv").textContent=test.m.toFixed(2);
     $("#erPrev").innerHTML=previewHTML(test,acById(r.acId));
   };
-  ["erF","erM","erMkt"].forEach(i=>$("#"+i).oninput=upd);upd();
-  $("#erOk").onclick=()=>{r.freq=+$("#erF").value;r.m=+$("#erM").value;r.marketing=$("#erMkt").checked;closeModal();renderRoutes();save();};
+  bindSvcButtons("#erSvc",v=>{svcSel=v;$$("#erSvc button").forEach(b=>b.classList.toggle("primary",+b.dataset.s===v));upd();});
+  ["erF","erM","erMkt"].forEach(i=>$("#"+i)&&($("#"+i).oninput=upd));upd();
+  $("#erOk").onclick=()=>{r.freq=+$("#erF").value;r.m=+$("#erM").value;r.marketing=$("#erMkt").checked;r.svc=svcSel;closeModal();renderRoutes();save();};
 };
+function svcButtonsHTML(sel,dist){
+  return SVC.map((s,i)=>`<button class="btn sm ${sel===i?"primary":""}" data-s="${i}" ${dist<s.minKm?"disabled title='needs "+fmtKm(s.minKm)+"+'":""}>${s.name}${s.cost?" $"+s.cost+"/pax":""}</button>`).join("");
+}
+function bindSvcButtons(sel,cb){
+  $$(sel+" button").forEach(b=>b.onclick=()=>cb(+b.dataset.s));
+}
 function previewHTML(r,acObj){
   const d=dailyEcon(r,acObj);
   const lines=[["Revenue ("+(r.type==="pax"?"pax":"cargo")+")",r.type==="pax"?d.revPax:d.revCargo,"pos"]];
   if(d.revBelly)lines.push(["Belly cargo revenue",d.revBelly,"pos"]);
   lines.push(["Fuel",-d.fuel],["Crew",-d.crew],["Landing fees",-d.fee],["Maintenance",-d.maint]);
+  if(d.svc)lines.push(["On-board service",-d.svc]);
   if(r.marketing)lines.push(["Marketing",-25e3]);
   const profit=d.profit-(r.marketing?25e3:0);
-  return `<div class="line"><span>${d.legs} legs/day · ${r.type==="pax"?fmtNum(d.pax)+" pax":d.tonnes.toFixed(1)+"t"}/day · load ${Math.round(d.load*100)}%</span></div>`+
+  return `<div class="line"><span>Flight rating <b style="color:${d.rating>=65?"var(--ok)":d.rating>=40?"var(--warn)":"var(--bad)"}">★ ${d.rating}</b> · image ${Math.round(S.image||50)}</span></div>`+
+    `<div class="line"><span>${d.legs} legs/day · ${r.type==="pax"?fmtNum(d.pax)+" pax":d.tonnes.toFixed(1)+"t"}/day · load ${Math.round(d.load*100)}%</span></div>`+
     lines.map(([l,v,c])=>`<div class="line"><span>${l}</span><span class="${c||(v<0?"neg":"")}">${fmtMoney(v)}</span></div>`).join("")+
     `<div class="line total"><span>Projected daily profit</span><span class="${profit>=0?"pos":"neg"}">${fmtMoney(profit)}</span></div>`;
 }
 
 // ---------- New Route wizard ----------
-const RW={step:0,type:"pax",from:null,to:null,acId:null,freq:1,m:1};
+const RW={step:0,type:"pax",from:null,to:null,acId:null,freq:1,m:1,svc:1};
 window.openRouteWizard=function(pre){
-  Object.assign(RW,{step:0,type:"pax",from:S.mainHub,to:pre&&pre.to||null,acId:null,freq:1,m:1});
+  Object.assign(RW,{step:0,type:"pax",from:S.mainHub,to:pre&&pre.to||null,acId:null,freq:1,m:1,svc:1});
   renderRW();
 };
 function freeAircraft(type){ return S.fleet.filter(a=>AC[a.model].kind===type&&!S.routes.some(r=>r.acId===a.id)); }
@@ -902,13 +955,14 @@ function renderRW(){
       <div class="grid2"><div>
       <div class="field"><label>Round trips/day: <b id="rwFv">${RW.freq}</b> (max ${cap})</label><input type="range" id="rwF" min="1" max="${cap}" value="${RW.freq}"></div>
       <div class="field"><label>Price multiplier: ×<b id="rwMv">${RW.m.toFixed(2)}</b></label><input type="range" id="rwM" min="0.5" max="2" step="0.05" value="${RW.m}"></div>
+      ${RW.type==="pax"?`<div class="field"><label>On-board service</label><div class="row" id="rwSvc">${svcButtonsHTML(RW.svc,distKm(RW.from,RW.to))}</div></div>`:""}
       <p class="sub">${esc(ac.model)} · ${RW.from}–${RW.to}</p></div>
       <div class="preview" id="rwPrev"></div></div>`;
   }else{
     const ac=acById(RW.acId);
     body=`<h2>Confirm route</h2>
-      <div class="preview mb">${previewHTML({type:RW.type,from:RW.from,to:RW.to,acModel:ac.model,acId:ac.id,freq:RW.freq,m:RW.m,marketing:false},ac)}</div>
-      <p class="sub mb">${RW.type==="pax"?"👤 Passenger":"📦 Cargo"} · ${RW.from}–${RW.to} · ${esc(ac.model)} · ${RW.freq}×/day · ×${RW.m.toFixed(2)}</p>`;
+      <div class="preview mb">${previewHTML({type:RW.type,from:RW.from,to:RW.to,acModel:ac.model,acId:ac.id,freq:RW.freq,m:RW.m,marketing:false,svc:RW.svc},ac)}</div>
+      <p class="sub mb">${RW.type==="pax"?"👤 Passenger":"📦 Cargo"} · ${RW.from}–${RW.to} · ${esc(ac.model)} · ${RW.freq}×/day · ×${RW.m.toFixed(2)}${RW.type==="pax"?" · "+SVC[effSvcTier({svc:RW.svc},distKm(RW.from,RW.to))].name:""}</p>`;
   }
   const canNext=RW.step===0?true:RW.step===1?!!RW.from:RW.step===2?!!RW.to:RW.step===3?!!RW.acId&&AC[acById(RW.acId).model].range>=distKm(RW.from,RW.to):true;
   openModal(body+`<div class="row" style="margin-top:16px;justify-content:space-between">
@@ -922,7 +976,8 @@ function renderRW(){
     const upd=()=>{RW.freq=+$("#rwF").value;RW.m=+$("#rwM").value;
       $("#rwFv").textContent=RW.freq;$("#rwMv").textContent=RW.m.toFixed(2);
       const ac=acById(RW.acId);
-      $("#rwPrev").innerHTML=previewHTML({type:RW.type,from:RW.from,to:RW.to,acModel:ac.model,acId:ac.id,freq:RW.freq,m:RW.m,marketing:false},ac);};
+      $("#rwPrev").innerHTML=previewHTML({type:RW.type,from:RW.from,to:RW.to,acModel:ac.model,acId:ac.id,freq:RW.freq,m:RW.m,marketing:false,svc:RW.svc},ac);};
+    bindSvcButtons("#rwSvc",v=>{RW.svc=v;$$("#rwSvc button").forEach(b=>b.classList.toggle("primary",+b.dataset.s===v));upd();});
     $("#rwF").oninput=upd;$("#rwM").oninput=upd;upd();
   }
 }
@@ -941,7 +996,7 @@ window.rwSet=function(k,v){RW[k]=v;if(k==="type")RW.acId=null;renderRW();};
 window.rwStep=function(d){RW.step+=d;renderRW();};
 window.rwConfirm=function(){
   const ac=acById(RW.acId);
-  const r={id:S.nextRouteId++,type:RW.type,from:RW.from,to:RW.to,acId:ac.id,acModel:ac.model,freq:RW.freq,m:RW.m,marketing:false,loads:[],legsToday:0,dayRef:S.day,nextDep:Math.max(S.t,(S.day-1)*1440+360),bellyUsedToday:0,profitToday:0,paxToday:0,seatsToday:0};
+  const r={id:S.nextRouteId++,type:RW.type,from:RW.from,to:RW.to,acId:ac.id,acModel:ac.model,freq:RW.freq,m:RW.m,svc:RW.type==="pax"?RW.svc:0,marketing:false,loads:[],legsToday:0,dayRef:S.day,nextDep:Math.max(S.t,(S.day-1)*1440+360),bellyUsedToday:0,profitToday:0,paxToday:0,seatsToday:0};
   S.routes.push(r);
   closeModal();
   toast("Route opened",r.from+"–"+r.to+" · "+r.freq+"×/day","ok");
@@ -969,9 +1024,17 @@ function renderAirports(){
       ${[["iata","IATA"],["city","City"],["tier","Tier"],["dist","Distance from "+(S.mainHub||"—")],["status","Status"]].map(([k,l])=>`<th data-k="${k}">${l} ${APSORT.key===k?(APSORT.dir>0?"▲":"▼"):""}</th>`).join("")}</tr></thead>
       <tbody>${rows.map(a=>`<tr><td><b>${a.iata}</b></td><td>${esc(a.city)}</td><td><span class="stars">${"★".repeat(a.tier)}</span></td><td>${a.iata===S.mainHub?"—":fmtKm(a.dist)}</td><td>${a.status==="Hub"?'<span class="badge brand">HUB</span>':a.status}</td></tr>`).join("")}</tbody></table></div>
     <h3>Airlines</h3>
-    <div class="card" style="padding:0 8px"><table><thead><tr><th>Airline</th><th>Code</th><th>Base</th><th>Fleet</th><th>Routes</th></tr></thead>
-      <tbody>${rivalRows.map(r=>`<tr><td><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${r.color};margin-right:8px"></span><b>${esc(r.name)}</b></td><td>${r.code}</td><td>${r.base}</td><td>${r.fleet}</td><td>${r.routes}</td></tr>`).join("")}</tbody></table></div></div>`;
+    <p class="sub mb">Interlining links your network with a partner's: +10% demand on your routes touching their airports. $250K to sign, $10K/day to maintain.</p>
+    <div class="card" style="padding:0 8px"><table><thead><tr><th>Airline</th><th>Code</th><th>Base</th><th>Fleet</th><th>Routes</th><th>Interlining</th></tr></thead>
+      <tbody>${rivalRows.map((r,i)=>`<tr><td><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${r.color};margin-right:8px"></span><b>${esc(r.name)}</b></td><td>${r.code}</td><td>${r.base}</td><td>${r.fleet}</td><td>${r.routes}</td><td>${i===0?"—":
+        S.interline[r.name]?`<span class="badge ok">ACTIVE</span> <button class="btn sm" onclick="toggleInterline('${esc(r.name)}')">Cancel</button>`:
+        `<button class="btn sm primary" onclick="toggleInterline('${esc(r.name)}')" ${S.cash<250e3?"disabled":""}>Sign $250K</button>`}</td></tr>`).join("")}</tbody></table></div></div>`;
   $("#apSearch").oninput=e=>{el.dataset.q=e.target.value;renderAirports();$("#apSearch").focus();const v=$("#apSearch");v.setSelectionRange(v.value.length,v.value.length);};
+  window.toggleInterline=function(name){
+    if(S.interline[name]){S.interline[name]=false;toast("Interlining cancelled","Agreement with "+name+" ended");}
+    else{if(S.cash<250e3)return;spend(250e3,"interline");S.interline[name]=true;toast("Interlining signed","+10% demand on routes touching "+name+"'s network","ok");}
+    renderAirports();save();
+  };
   $$("#screen-airports th[data-k]").forEach(th=>th.onclick=()=>{const k=th.dataset.k;if(APSORT.key===k)APSORT.dir*=-1;else{APSORT.key=k;APSORT.dir=1;}renderAirports();});
 }
 
@@ -996,7 +1059,7 @@ function renderFinances(){
   }else chart=`<p class="sub">P&L chart appears after 2 full days.</p>`;
   // donut
   const sum=k=>hist.reduce((s,p)=>s+(p[k]||0),0);
-  const segs=[["Fuel",sum("fuel"),"#FF5C6C"],["Crew",sum("crew"),"#FFB020"],["Fees",sum("fees"),"#4DA3FF"],["Maint",sum("maint"),"#2ECC8F"],["Lease",sum("lease"),"#B388FF"],["Overhead",sum("overhead"),"#8DA0C0"],["Marketing",sum("marketing"),"#F472B6"]];
+  const segs=[["Fuel",sum("fuel"),"#FF5C6C"],["Crew",sum("crew"),"#FFB020"],["Fees",sum("fees"),"#4DA3FF"],["Maint",sum("maint"),"#2ECC8F"],["Lease",sum("lease"),"#B388FF"],["Overhead",sum("overhead"),"#8DA0C0"],["Marketing",sum("marketing"),"#F472B6"],["Service",sum("svc"),"#66D9E8"],["Interline",sum("interline"),"#9AA7FF"]];
   const tot=segs.reduce((s,x)=>s+x[1],0)||1;
   let acc=0;
   const donut=segs.map(([l,v,c])=>{const a0=acc/tot*2*Math.PI-Math.PI/2;acc+=v;const a1=acc/tot*2*Math.PI-Math.PI/2;
@@ -1228,6 +1291,11 @@ function init(){
   const saved=load();
   if(saved&&saved.started&&!saved.gameOver){
     S=saved;
+    // migrate pre-FRS saves
+    if(S.image===undefined)S.image=50;
+    if(!S.interline)S.interline={};
+    if(S.today.svc===undefined){S.today.svc=0;S.today.interline=0;}
+    S.routes.forEach(r=>{if(r.svc===undefined)r.svc=r.type==="pax"?1:0;});
     S.fleet.forEach(a=>{if(a.inFlight&&!S.flights.some(f=>routeById(f.routeId)&&routeById(f.routeId).acId===a.id))a.inFlight=false;});
     bootUI();
   }else{
