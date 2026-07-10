@@ -40,6 +40,13 @@ function crewRate(ac){
 const isWide = ac => ["Widebody","Large","Jumbo"].includes(ac.cls);
 function fleetFamilies(){ return new Set(S.fleet.map(a=>FAMILY(a.model))).size; }
 function maintSurcharge(){ return Math.max(0,fleetFamilies()-3)*0.15; }
+// Runway physics: altitude-adjusted required runway; single source of truth
+const CLASS_MIN_RW={Turboprop:3600,Regional:5800,Narrowbody:6600,Widebody:8500,Large:9500,Jumbo:10000};
+const CLASS_ORDER=["Turboprop","Regional","Narrowbody","Widebody","Large","Jumbo"];
+function reqRunwayFt(spec,ap){ return spec.minRunwayFt*(1+(ap.elev||0)/25000); }
+function canOperate(spec,ap){ return (ap.rw||0)>=reqRunwayFt(spec,ap); }
+function runwayReason(spec,ap){ return `Runway too short — needs ${fmtNum(reqRunwayFt(spec,ap))} ft (adj. for altitude), longest here is ${fmtNum(ap.rw||0)} ft`; }
+function maxClassAt(ap){ let best="—"; for(const c of CLASS_ORDER) if((ap.rw||0)>=CLASS_MIN_RW[c]*(1+(ap.elev||0)/25000)) best=c; return best; }
 function effSvcTier(r,dist){ let t=r.svc||0; while(t>0&&dist<SVC[t].minKm)t--; return t; }
 // Flight Rating System: 0–100 from price, service, comfort, condition
 function routeRating(r,acObj){
@@ -292,28 +299,49 @@ function posOnArc(coords,prog){
 // ---------- Map ----------
 function initMap(){
   if(RT.map)return;
-  RT.map=L.map("map",{minZoom:2,maxZoom:7,worldCopyJump:true,zoomControl:true}).setView([30,10],2);
+  RT.map=L.map("map",{minZoom:2,maxZoom:7,worldCopyJump:true,zoomControl:true,preferCanvas:true}).setView([30,10],2);
   L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",{attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'}).addTo(RT.map);
   renderAirportMarkers();
   renderRouteLines();
   initRivalPlanes();
-}
-function apMarkerHtml(a){
-  const isHub=S.hubs.includes(a.iata), served=S.routes.some(r=>r.from===a.iata||r.to===a.iata);
-  if(isHub)return `<div style="width:14px;height:14px;border-radius:50%;background:${S.livery.base};border:2px solid #fff;box-shadow:0 0 6px ${S.livery.base}"></div><div class="ap-label" style="margin-top:1px">${a.iata}</div>`;
-  if(served)return `<div style="width:8px;height:8px;border-radius:50%;border:2px solid ${S.livery.base};background:transparent"></div>`;
-  return `<div style="width:5px;height:5px;border-radius:50%;background:#5A6B8C"></div>`;
+  $("#mapSearch").onkeydown=e=>{
+    if(e.key!=="Enter")return;
+    const q=e.target.value.trim().toLowerCase(); if(!q)return;
+    const hit=AP[q.toUpperCase()]||AIRPORTS.find(a=>a.city.toLowerCase().startsWith(q))||AIRPORTS.find(a=>a.city.toLowerCase().includes(q));
+    if(!hit){toast("Not found","No airport matches \""+e.target.value+"\"","warn");return;}
+    RT.map.setView([hit.lat,hit.lng],Math.max(RT.map.getZoom(),5),{animate:false});
+    openAirportPopup(hit,null);
+  };
 }
 function renderAirportMarkers(){
-  for(const k in RT.apMarkers)RT.map.removeLayer(RT.apMarkers[k]);
-  RT.apMarkers={};
+  if(!RT.apLayer){
+    RT.apLayer=L.layerGroup().addTo(RT.map);
+    RT.map.on("moveend zoomend",renderAirportMarkers);
+  }
+  RT.apLayer.clearLayers();
+  const z=RT.map.getZoom(), b=RT.map.getBounds().pad(0.25);
+  const mine=new Set(S.hubs.concat(S.routes.flatMap(r=>[r.from,r.to])));
   for(const a of AIRPORTS){
-    const m=L.marker([a.lat,a.lng],{icon:L.divIcon({className:"ap-label",html:apMarkerHtml(a),iconSize:[40,26],iconAnchor:[7,7]})}).addTo(RT.map);
+    const isHub=S.hubs.includes(a.iata), served=mine.has(a.iata);
+    if(!isHub&&!served){
+      if(z<=3&&a.tier<3)continue;
+      if(!b.contains([a.lat,a.lng]))continue;
+    }
+    let m;
+    if(isHub){
+      m=L.marker([a.lat,a.lng],{icon:L.divIcon({className:"ap-label",html:`<div style="width:14px;height:14px;border-radius:50%;background:${S.livery.base};border:2px solid #fff;box-shadow:0 0 6px ${S.livery.base}"></div><div class="ap-label" style="margin-top:1px">${a.iata}</div>`,iconSize:[40,26],iconAnchor:[7,7]})});
+    }else if(served){
+      m=L.circleMarker([a.lat,a.lng],{radius:6,color:S.livery.base,weight:2,fill:false});
+      if(z>=5)m.bindTooltip(a.iata,{permanent:true,direction:"top",className:"ap-tip",offset:[0,-6]});
+    }else{
+      m=L.circleMarker([a.lat,a.lng],{radius:a.tier>=4?4.5:a.tier===3?3.5:2.5,stroke:false,fillColor:a.tier>=4?"#8DA0C0":"#5A6B8C",fillOpacity:0.8});
+      if(z>=6||(z>=5&&a.tier>=3))m.bindTooltip(a.iata,{permanent:true,direction:"top",className:"ap-tip",offset:[0,-6]});
+    }
     m.on("click",()=>openAirportPopup(a,m));
-    RT.apMarkers[a.iata]=m;
+    RT.apLayer.addLayer(m);
   }
 }
-function openAirportPopup(a,m){
+function airportPopupHTML(a){
   const isHub=S.hubs.includes(a.iata);
   const myPax=S.routes.filter(r=>r.type==="pax"&&(r.from===a.iata||r.to===a.iata)).reduce((s,r)=>{const d=dailyEcon(r,acById(r.acId));return s+d.pax;},0);
   const g=gate({tier:a.tier});
@@ -321,7 +349,17 @@ function openAirportPopup(a,m){
   let btn=isHub?`<span class="badge brand">HUB</span>`:
     g?`<span class="badge">${g}</span>`:
     `<button class="btn sm primary" onclick="openHub('${a.iata}')" ${S.cash<cost?"disabled":""}>Open Hub ${fmtMoney(cost)}</button>`;
-  m.bindPopup(`<b>${esc(a.city)} (${a.iata})</b><br><span class="stars">${"★".repeat(a.tier)}</span><br>My daily pax: ${fmtNum(myPax)}<br>${btn}`).openPopup();
+  let ops="";
+  if(isHub&&S.fleet.length){
+    const models=[...new Set(S.fleet.map(x=>x.model))];
+    const ok=models.filter(mo=>canOperate(AC[mo],a)), no=models.filter(mo=>!canOperate(AC[mo],a));
+    ops=`<br><span class="sub">Operable: ${ok.join(", ")||"none"}${no.length?" · Blocked: "+no.join(", "):""}</span>`;
+  }
+  return `<b>${esc(a.city)} (${a.iata})</b><br><span class="stars">${"★".repeat(a.tier)}</span> <span class="badge">${maxClassAt(a)}</span><br>Runway ${fmtNum(a.rw)} ft${a.elev>2000?` · elev ${fmtNum(a.elev)} ft`:""}<br>My daily pax: ${fmtNum(myPax)}${ops}<br>${btn}`;
+}
+function openAirportPopup(a,m){
+  if(m)m.bindPopup(airportPopupHTML(a)).openPopup();
+  else L.popup().setLatLng([a.lat,a.lng]).setContent(airportPopupHTML(a)).openOn(RT.map);
 }
 window.openHub=function(iata){
   const a=AP[iata], cost=TIERS[a.tier].hubCost;
@@ -716,7 +754,7 @@ function renderFleet(){
     return `<div class="fleet-card">
       ${fuselageSVG(S.livery,{w:400,h:110,retro:spec.classic,uid:a.id,name:S.code})}
       <div class="fleet-title">${esc(a.model)} ${spec.classic?'<span class="badge classic">CLASSIC</span>':""}${a.leased?'<span class="badge">LEASED</span>':""}${spec.kind==="cargo"?'<span class="badge">📦 FREIGHTER</span>':""}</div>
-      <div class="fleet-meta">Base ${a.hub} · ${status} · ${spec.kind==="cargo"?spec.cap+"t payload":cfg.e+"E/"+cfg.p+"P/"+cfg.b+"B seats"}</div>
+      <div class="fleet-meta">Base ${a.hub} · ${status} · ${spec.kind==="cargo"?spec.cap+"t payload":cfg.e+"E/"+cfg.p+"P/"+cfg.b+"B seats"} · min rwy ${fmtNum(spec.minRunwayFt)} ft</div>
       <div class="fleet-stats"><span>Condition ${Math.round(a.condition)}%</span><span>Util ${Math.round((a.utilYest||0)*100)}%</span><span>Today <span class="${(a.profitToday||0)>=0?"pos":"neg"}">${fmtMoney(a.profitToday||0)}</span></span></div>
       <div class="bar"><i style="width:${a.condition}%;background:${condColor(a.condition)}"></i></div>
       ${spec.kind==="cargo"?`<div class="sub" style="margin-top:6px">Payload</div><div class="bar"><i style="width:100%;background:var(--info)"></i></div>`:""}
@@ -757,9 +795,11 @@ window.sellAc=function(id){
   };
 };
 window.openReassign=function(id){
-  const a=acById(id);
+  const a=acById(id),spec=AC[a.model];
   openModal(`<h2>Reassign Hub — ${esc(a.model)}</h2>
-    <div class="field"><label>New base hub</label><select id="rhSel">${S.hubs.map(h=>`<option ${h===a.hub?"selected":""}>${h}</option>`).join("")}</select></div>
+    <div class="field"><label>New base hub (needs ${fmtNum(spec.minRunwayFt)} ft, adj. for altitude)</label>
+    <select id="rhSel">${S.hubs.map(h=>{const ok=canOperate(spec,AP[h]);
+      return `<option value="${h}" ${h===a.hub?"selected":""} ${ok?"":"disabled"}>${h}${ok?"":" — "+runwayReason(spec,AP[h])}</option>`;}).join("")}</select></div>
     <div class="row"><button class="btn primary" id="rhOk">Reassign</button><button class="btn" onclick="closeModal()">Cancel</button></div>`);
   $("#rhOk").onclick=()=>{a.hub=$("#rhSel").value;closeModal();renderFleet();save();};
 };
@@ -816,14 +856,21 @@ window.openBuyModal=function(tab){
     <tbody>${rows(lists[tab])}</tbody></table>
     <div class="row" style="margin-top:16px"><button class="btn" onclick="closeModal()">Close</button></div>`,true);
 };
-window.buyAc=function(model,leased){
+window.buyAc=function(model,leased,force){
   const spec=AC[model];
   if(!leased&&S.cash<spec.price)return;
   if(gate({ac:model}))return;
+  const okHubs=S.hubs.filter(h=>canOperate(spec,AP[h]));
+  if(!okHubs.length&&!force){
+    openModal(`<h2>⚠️ No suitable hub</h2>
+      <p class="mb">None of your hubs can host the <b>${esc(model)}</b>: ${runwayReason(spec,AP[S.mainHub])}. It will sit idle until you open a hub with a long enough runway.</p>
+      <div class="row"><button class="btn primary" onclick="buyAc('${esc(model)}',${!!leased},true)">${leased?"Lease":"Buy"} Anyway</button><button class="btn" onclick="closeModal()">Cancel</button></div>`);
+    return;
+  }
   const cond=spec.classic?(S.usedRolls[model]||Math.round(rand(65,85))):100;
   if(!leased)spend(spec.price,"other");
   else{spend(spec.lease/30,"lease");}
-  S.fleet.push({id:S.nextAcId++,model,hub:S.mainHub,condition:cond,biz:0,prem:0,leased:!!leased,inFlight:false,status:"ok",statusUntil:0,hoursToday:0,profitToday:0});
+  S.fleet.push({id:S.nextAcId++,model,hub:okHubs[0]||S.mainHub,condition:cond,biz:0,prem:0,leased:!!leased,inFlight:false,status:"ok",statusUntil:0,hoursToday:0,profitToday:0});
   toast(leased?"Aircraft leased":"Aircraft purchased",model+(spec.classic?" — delivered at "+cond+"% condition":""),"ok");
   checkAchievements(); checkLevel(); save();
   closeModal(); if(currentScreen()==="fleet")renderFleet();
@@ -937,15 +984,21 @@ function renderRW(){
         const pool=RW.type==="pax"?Math.min(TIERS[AP[RW.from].tier].pool,TIERS[a.tier].pool)*falloff(dist)*famousMult(RW.from,a.iata):Math.min(CARGO_POOL[AP[RW.from].tier],CARGO_POOL[a.tier])*falloff(dist);
         return {a,dist,pool};}).sort((x,y)=>y.pool-x.pool);
     body=`<h2>New Route — Destination from ${RW.from}</h2>
-      <input type="text" id="rwSearch" placeholder="Search city or IATA…">
-      <div class="dest-list" id="rwDests">${dests.map(d=>`<div class="item ${RW.to===d.a.iata?"sel":""}" data-iata="${d.a.iata}" data-q="${d.a.iata.toLowerCase()} ${esc(d.a.city).toLowerCase()}"><span><b>${d.a.iata}</b> ${esc(d.a.city)} <span class="stars">${"★".repeat(d.a.tier)}</span></span><span class="sub">${fmtKm(d.dist)} · demand ${fmtNum(d.pool)}${RW.type==="cargo"?"t":""}/day</span></div>`).join("")}</div>`;
+      <input type="text" id="rwSearch" placeholder="Search ${fmtNum(dests.length)} airports by city or IATA…">
+      <div class="dest-list" id="rwDests">${dests.slice(0,150).map(d=>`<div class="item ${RW.to===d.a.iata?"sel":""}" data-iata="${d.a.iata}"><span><b>${d.a.iata}</b> ${esc(d.a.city)} <span class="stars">${"★".repeat(d.a.tier)}</span> <span class="badge">${maxClassAt(d.a)}</span></span><span class="sub">${fmtKm(d.dist)} · rwy ${fmtNum(d.a.rw)} ft · demand ${fmtNum(d.pool)}${RW.type==="cargo"?"t":""}/day</span></div>`).join("")}</div>
+      <p class="sub" id="rwDestNote">Top 150 by demand shown — type to search all ${fmtNum(dests.length)}.</p>`;
   }else if(RW.step===3){
     const dist=distKm(RW.from,RW.to);
     const avail=freeAircraft(RW.type);
     body=`<h2>New Route — Aircraft (${RW.from}–${RW.to}, ${fmtKm(dist)})</h2>
       ${rwMiniMap(dist)}
-      ${avail.length?`<div class="ac-pick">${avail.map(a=>{const spec=AC[a.model];const ok=spec.range>=dist;
-        return `<div class="item ${RW.acId===a.id?"sel":""} ${ok?"":"dim"}" onclick="rwSet('acId',${a.id})"><b>${esc(a.model)}</b> ${spec.classic?'<span class="badge classic">C</span>':""}<br><span class="sub">${spec.kind==="cargo"?spec.cap+"t":spec.cap+" seats"} · range ${fmtKm(spec.range)} ${ok?"✓":"— too short"}</span></div>`;}).join("")}</div>`:
+      ${avail.length?`<div class="ac-pick">${avail.map(a=>{const spec=AC[a.model];
+        const rangeOk=spec.range>=dist, fromOk=canOperate(spec,AP[RW.from]), toOk=canOperate(spec,AP[RW.to]);
+        const ok=rangeOk&&fromOk&&toOk;
+        let why=rangeOk?"":"range too short";
+        if(!fromOk)why=(why?why+"; ":"")+"runway at "+RW.from+" ("+runwayReason(spec,AP[RW.from]).split("— ")[1]+")";
+        if(!toOk)why=(why?why+"; ":"")+"runway at "+RW.to+" ("+runwayReason(spec,AP[RW.to]).split("— ")[1]+")";
+        return `<div class="item ${RW.acId===a.id?"sel":""} ${ok?"":"dim"}" onclick="rwSet('acId',${a.id})"><b>${esc(a.model)}</b> ${spec.classic?'<span class="badge classic">C</span>':""}<br><span class="sub">${spec.kind==="cargo"?spec.cap+"t":spec.cap+" seats"} · range ${fmtKm(spec.range)} · needs ${fmtNum(spec.minRunwayFt)} ft ${ok?"✓":"— "+why}</span></div>`;}).join("")}</div>`:
       `<p class="sub">No unassigned ${RW.type==="cargo"?"freighters":"passenger aircraft"}. Buy one first.</p>`}`;
   }else if(RW.step===4){
     const ac=acById(RW.acId),spec=AC[ac.model];
@@ -964,13 +1017,22 @@ function renderRW(){
       <div class="preview mb">${previewHTML({type:RW.type,from:RW.from,to:RW.to,acModel:ac.model,acId:ac.id,freq:RW.freq,m:RW.m,marketing:false,svc:RW.svc},ac)}</div>
       <p class="sub mb">${RW.type==="pax"?"👤 Passenger":"📦 Cargo"} · ${RW.from}–${RW.to} · ${esc(ac.model)} · ${RW.freq}×/day · ×${RW.m.toFixed(2)}${RW.type==="pax"?" · "+SVC[effSvcTier({svc:RW.svc},distKm(RW.from,RW.to))].name:""}</p>`;
   }
-  const canNext=RW.step===0?true:RW.step===1?!!RW.from:RW.step===2?!!RW.to:RW.step===3?!!RW.acId&&AC[acById(RW.acId).model].range>=distKm(RW.from,RW.to):true;
+  const canNext=RW.step===0?true:RW.step===1?!!RW.from:RW.step===2?!!RW.to:
+    RW.step===3?(()=>{if(!RW.acId)return false;const spec=AC[acById(RW.acId).model];
+      return spec.range>=distKm(RW.from,RW.to)&&canOperate(spec,AP[RW.from])&&canOperate(spec,AP[RW.to]);})():true;
   openModal(body+`<div class="row" style="margin-top:16px;justify-content:space-between">
     <button class="btn" onclick="${RW.step===0?"closeModal()":"rwStep(-1)"}">${RW.step===0?"Cancel":"Back"}</button>
     <button class="btn primary" onclick="${RW.step===5?"rwConfirm()":"rwStep(1)"}" ${canNext?"":"disabled"}>${RW.step===5?"Open Route":"Next"}</button></div>`,true);
   if(RW.step===2){
-    $("#rwSearch").oninput=e=>{const q=e.target.value.toLowerCase();$$("#rwDests .item").forEach(i=>i.style.display=i.dataset.q.includes(q)?"":"none");};
-    $$("#rwDests .item").forEach(i=>i.onclick=()=>rwSet("to",i.dataset.iata));
+    const bindDest=()=>$$("#rwDests .item").forEach(i=>i.onclick=()=>rwSet("to",i.dataset.iata));
+    $("#rwSearch").oninput=e=>{
+      const q=e.target.value.toLowerCase();
+      const match=AIRPORTS.filter(a=>a.iata!==RW.from&&(a.iata.toLowerCase().includes(q)||a.city.toLowerCase().includes(q)))
+        .map(a=>({a,dist:distKm(RW.from,a.iata)})).slice(0,150);
+      $("#rwDests").innerHTML=match.map(d=>`<div class="item" data-iata="${d.a.iata}"><span><b>${d.a.iata}</b> ${esc(d.a.city)} <span class="stars">${"★".repeat(d.a.tier)}</span> <span class="badge">${maxClassAt(d.a)}</span></span><span class="sub">${fmtKm(d.dist)} · rwy ${fmtNum(d.a.rw)} ft</span></div>`).join("")||'<div class="item">No match</div>';
+      bindDest();
+    };
+    bindDest();
   }
   if(RW.step===4){
     const upd=()=>{RW.freq=+$("#rwF").value;RW.m=+$("#rwM").value;
@@ -1011,18 +1073,25 @@ const APSORT={key:"tier",dir:-1};
 function renderAirports(){
   const el=$("#screen-airports");
   const q=(el.dataset.q||"").toLowerCase();
-  let rows=AIRPORTS.map(a=>({...a,dist:S.mainHub?distKm(S.mainHub,a.iata):0,
-    status:S.hubs.includes(a.iata)?"Hub":S.routes.some(r=>r.from===a.iata||r.to===a.iata)?"Served":"—"}));
+  const hostModel=el.dataset.host||"";
+  let rows=AIRPORTS.map(a=>({...a,dist:S.mainHub?distKm(S.mainHub,a.iata):0,mc:CLASS_ORDER.indexOf(maxClassAt(a)),
+    status:S.hubs.includes(a.iata)?"Hub":S.routes.some(r=>r.from===a.iata||r.to===a.iata)?"Served":"—",
+    canHost:!hostModel||canOperate(AC[hostModel],a)}));
+  const total=rows.length;
   if(q)rows=rows.filter(a=>a.iata.toLowerCase().includes(q)||a.city.toLowerCase().includes(q));
   rows.sort((x,y)=>{const k=APSORT.key;return (x[k]>y[k]?1:x[k]<y[k]?-1:0)*APSORT.dir;});
+  const shown=rows.slice(0,300);
+  const myModels=[...new Set(S.fleet.map(a=>a.model))];
   const rivalRows=[{name:S.airline+" (you)",code:S.code,color:S.livery.base,fleet:S.fleet.length,routes:S.routes.length,base:S.mainHub}]
     .concat(RIVALS.map(rv=>{const extra=S.rivalExtra.filter(x=>x.airline===rv.name).length;
       return {name:rv.name,code:rv.code,color:rv.color,fleet:rv.routes.length+extra+4,routes:rv.routes.length+extra,base:rv.base};}));
-  el.innerHTML=`<div class="inner"><h1>Airports</h1>
-    <input type="text" id="apSearch" placeholder="Search airports…" value="${esc(el.dataset.q||"")}" style="max-width:320px;margin-bottom:12px">
+  el.innerHTML=`<div class="inner"><h1>Airports <span class="sub">${fmtNum(total)} worldwide</span></h1>
+    <div class="row mb"><input type="text" id="apSearch" placeholder="Search ${fmtNum(total)} airports…" value="${esc(el.dataset.q||"")}" style="max-width:320px">
+    <span class="chip">Can host: <select id="apHost" style="width:auto;padding:2px 6px;font-size:12px">${['<option value="">any aircraft</option>'].concat(myModels.map(m=>`<option ${hostModel===m?"selected":""}>${m}</option>`)).join("")}</select></span></div>
     <div class="card mb" style="padding:0 8px"><table><thead><tr>
-      ${[["iata","IATA"],["city","City"],["tier","Tier"],["dist","Distance from "+(S.mainHub||"—")],["status","Status"]].map(([k,l])=>`<th data-k="${k}">${l} ${APSORT.key===k?(APSORT.dir>0?"▲":"▼"):""}</th>`).join("")}</tr></thead>
-      <tbody>${rows.map(a=>`<tr><td><b>${a.iata}</b></td><td>${esc(a.city)}</td><td><span class="stars">${"★".repeat(a.tier)}</span></td><td>${a.iata===S.mainHub?"—":fmtKm(a.dist)}</td><td>${a.status==="Hub"?'<span class="badge brand">HUB</span>':a.status}</td></tr>`).join("")}</tbody></table></div>
+      ${[["iata","IATA"],["city","City"],["tier","Tier"],["rw","Longest runway"],["mc","Max class"],["dist","Distance from "+(S.mainHub||"—")],["status","Status"]].map(([k,l])=>`<th data-k="${k}">${l} ${APSORT.key===k?(APSORT.dir>0?"▲":"▼"):""}</th>`).join("")}</tr></thead>
+      <tbody>${shown.map(a=>`<tr class="${a.canHost?"":"dim-row"}" ${a.canHost?"":`title="${runwayReason(AC[hostModel],a)}"`}><td><b>${a.iata}</b></td><td>${esc(a.city)}</td><td><span class="stars">${"★".repeat(a.tier)}</span></td><td>${fmtNum(a.rw)} ft${a.elev>2000?` <span class="sub">@${fmtNum(a.elev)} ft</span>`:""}</td><td><span class="badge">${a.mc>=0?CLASS_ORDER[a.mc]:"—"}</span></td><td>${a.iata===S.mainHub?"—":fmtKm(a.dist)}</td><td>${a.status==="Hub"?'<span class="badge brand">HUB</span>':a.status}</td></tr>`).join("")}</tbody></table>
+      ${rows.length>300?`<p class="sub" style="padding:8px 10px">Showing 300 of ${fmtNum(rows.length)} — refine your search.</p>`:""}</div>
     <h3>Airlines</h3>
     <p class="sub mb">Interlining links your network with a partner's: +10% demand on your routes touching their airports. $250K to sign, $10K/day to maintain.</p>
     <div class="card" style="padding:0 8px"><table><thead><tr><th>Airline</th><th>Code</th><th>Base</th><th>Fleet</th><th>Routes</th><th>Interlining</th></tr></thead>
@@ -1030,6 +1099,7 @@ function renderAirports(){
         S.interline[r.name]?`<span class="badge ok">ACTIVE</span> <button class="btn sm" onclick="toggleInterline('${esc(r.name)}')">Cancel</button>`:
         `<button class="btn sm primary" onclick="toggleInterline('${esc(r.name)}')" ${S.cash<250e3?"disabled":""}>Sign $250K</button>`}</td></tr>`).join("")}</tbody></table></div></div>`;
   $("#apSearch").oninput=e=>{el.dataset.q=e.target.value;renderAirports();$("#apSearch").focus();const v=$("#apSearch");v.setSelectionRange(v.value.length,v.value.length);};
+  $("#apHost").onchange=e=>{el.dataset.host=e.target.value;renderAirports();};
   window.toggleInterline=function(name){
     if(S.interline[name]){S.interline[name]=false;toast("Interlining cancelled","Agreement with "+name+" ended");}
     else{if(S.cash<250e3)return;spend(250e3,"interline");S.interline[name]=true;toast("Interlining signed","+10% demand on routes touching "+name+"'s network","ok");}
@@ -1183,7 +1253,7 @@ function openSaveModal(){
 }
 
 // ---------- First-run wizard ----------
-const WZ={step:0,name:"",code:"",diff:"Normal",hub:null,ac:"A220-300",lease:false,base:"#4DA3FF",accent:"#E8EEF9",pattern:"cheatline"};
+const WZ={step:0,name:"",code:"",diff:"Normal",hub:null,hubQ:"",ac:"A220-300",lease:false,base:"#4DA3FF",accent:"#E8EEF9",pattern:"cheatline"};
 function renderWizard(){
   const w=$("#wizard");
   w.classList.remove("hidden");
@@ -1196,8 +1266,11 @@ function renderWizard(){
       <div class="row mb">${["Easy","Normal","Hard"].map(d=>`<button class="btn ${WZ.diff===d?"primary":""}" data-d="${d}">${d}<br><span class="sub">${d==="Easy"?"$100M":d==="Normal"?"$50M":"$25M"}</span></button>`).join("")}</div>`;
   }else if(WZ.step===1){
     const recs=["SEA","MUC","BKK"];
-    body=`<h1>Choose your starting hub</h1><p class="sub">Tier 1–3 airports only. ★ = recommended.</p>
-      <div class="hub-pick">${AIRPORTS.filter(a=>a.tier<=3).map(a=>`<button class="${WZ.hub===a.iata?"sel":""}" data-h="${a.iata}"><b>${a.iata}</b> ${recs.includes(a.iata)?"⭐":""}<br>${esc(a.city)} <span class="stars">${"★".repeat(a.tier)}</span></button>`).join("")}</div>`;
+    const eligible=AIRPORTS.filter(a=>a.tier<=3&&a.rw>=6200);
+    const shown=(WZ.hubQ?eligible.filter(a=>a.iata.toLowerCase().includes(WZ.hubQ)||a.city.toLowerCase().includes(WZ.hubQ)):eligible.filter(a=>recs.includes(a.iata)).concat(eligible.filter(a=>!recs.includes(a.iata)&&a.tier===3).sort((x,y)=>y.rw-x.rw))).slice(0,48);
+    body=`<h1>Choose your starting hub</h1><p class="sub">Tier 1–3 airports with a runway ≥ 6,200 ft (your starter jet must fit). ★ = recommended. ${fmtNum(eligible.length)} eligible — search for more.</p>
+      <input type="text" id="wzHubQ" placeholder="Search city or IATA…" value="${esc(WZ.hubQ||"")}" style="margin:8px 0">
+      <div class="hub-pick">${shown.map(a=>`<button class="${WZ.hub===a.iata?"sel":""}" data-h="${a.iata}"><b>${a.iata}</b> ${recs.includes(a.iata)?"⭐":""}<br>${esc(a.city)} <span class="stars">${"★".repeat(a.tier)}</span></button>`).join("")}</div>`;
   }else if(WZ.step===2){
     const opts=["A220-300","E195-E2","ATR 72-600","737 MAX 8"];
     const startCash=(WZ.diff==="Easy"?100e6:WZ.diff==="Hard"?25e6:50e6)-TIERS[AP[WZ.hub].tier].hubCost;
@@ -1230,7 +1303,10 @@ function renderWizard(){
     $("#wzCode").oninput=e=>WZ.code=e.target.value.toUpperCase();
     $$("[data-d]").forEach(b=>b.onclick=()=>{WZ.diff=b.dataset.d;renderWizard();});
   }
-  if(WZ.step===1)$$("[data-h]").forEach(b=>b.onclick=()=>{WZ.hub=b.dataset.h;renderWizard();});
+  if(WZ.step===1){
+    $$("[data-h]").forEach(b=>b.onclick=()=>{WZ.hub=b.dataset.h;renderWizard();});
+    $("#wzHubQ").oninput=e=>{WZ.hubQ=e.target.value.toLowerCase();renderWizard();const v=$("#wzHubQ");v.focus();v.setSelectionRange(v.value.length,v.value.length);};
+  }
   if(WZ.step===2){$$("[data-a]").forEach(b=>b.onclick=()=>{WZ.ac=b.dataset.a;renderWizard();});
     $$("[data-l]").forEach(b=>b.onclick=()=>{WZ.lease=b.dataset.l==="1";renderWizard();});}
   if(WZ.step===3){
@@ -1264,7 +1340,7 @@ function startGame(){
   $("#wizard").classList.add("hidden");
   bootUI();
   // suggested first route
-  const best=AIRPORTS.filter(a=>a.iata!==WZ.hub&&distKm(WZ.hub,a.iata)<=spec.range)
+  const best=AIRPORTS.filter(a=>a.iata!==WZ.hub&&distKm(WZ.hub,a.iata)<=spec.range&&canOperate(spec,a)&&canOperate(spec,AP[WZ.hub]))
     .map(a=>({a,pool:Math.min(TIERS[AP[WZ.hub].tier].pool,TIERS[a.tier].pool)*falloff(distKm(WZ.hub,a.iata))*famousMult(WZ.hub,a.iata)}))
     .sort((x,y)=>y.pool-x.pool)[0];
   const sp=$("#spotlight");
