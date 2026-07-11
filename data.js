@@ -3168,7 +3168,18 @@ const AIRCRAFT = [
 ["767-300F","Medium",95e6,850e3,52,6000,850,30,2100,"cargo",false,9500],
 ["A330-200F","Medium",115e6,1.0e6,70,7400,870,33,2200,"cargo",false,9000],
 ["777F","Heavy",180e6,1.55e6,102,9200,900,40,2600,"cargo",false,11000],
-["747-8F","Heavy",215e6,1.8e6,137,8100,910,48,3000,"cargo",false,11000]
+["747-8F","Heavy",215e6,1.8e6,137,8100,910,48,3000,"cargo",false,11000],
+["Cessna 208 Caravan","Commuter",3e6,35e3,12,1700,340,2,180,"pax",false,2200],
+["DHC-6 Twin Otter","Commuter",7e6,70e3,19,1400,340,3,220,"pax",false,1500],
+["E145","Regional",18e6,190e3,50,2800,830,7,560,"pax",false,5200],
+["A319neo","Narrowbody",54e6,490e3,160,6900,870,13,860,"pax",false,6400],
+["757-200","Narrowbody",40e6,0,239,7200,850,19,1200,"pax",true,7000],
+["A310-300","Widebody",35e6,0,240,8000,850,32,2300,"pax",true,8200],
+["MD-11","Widebody",30e6,0,293,12600,890,40,2700,"pax",true,9800],
+["A340-600","Large",60e6,0,380,14600,890,44,2900,"pax",true,10200],
+["Concorde","Supersonic",250e6,0,100,7200,2140,95,4800,"pax",false,11800],
+["A350F","Heavy",185e6,1.6e6,109,8700,900,39,2550,"cargo",false,9500],
+["767-300BCF","Classic",48e6,0,54,6000,850,31,2150,"cargo",true,9000]
 ].map(a=>({model:a[0],cls:a[1],price:a[2],lease:a[3],cap:a[4],range:a[5],speed:a[6],fuel:a[7],maint:a[8],kind:a[9],classic:a[10],minRunwayFt:a[11]}));
 const AC = {}; AIRCRAFT.forEach(a=>AC[a.model]=a);
 const BELLY = {Widebody:12,Large:15,Jumbo:18};
@@ -3186,16 +3197,24 @@ function FAMILY(model){
   if(model.startsWith("CRJ"))return "CRJ";
   if(model.startsWith("E1"))return "E-Jet";
   if(model.startsWith("A220"))return "A220";
-  if(model.startsWith("A32"))return "A320";
+  if(model.startsWith("A310"))return "A310";
+  if(model.startsWith("A319")||model.startsWith("A32"))return "A320";
+  if(model.startsWith("A340"))return "A340";
   if(model.startsWith("737"))return "737";
+  if(model.startsWith("757"))return "757";
   if(model.startsWith("767"))return "767";
   if(model.startsWith("787"))return "787";
   if(model.startsWith("A330"))return "A330";
   if(model.startsWith("A350"))return "A350";
   if(model.startsWith("777"))return "777";
   if(model.startsWith("747"))return "747";
+  if(model.startsWith("Cessna"))return "Cessna";
+  if(model.startsWith("DHC"))return "DHC";
+  if(model.startsWith("MD"))return "MD-11";
   return model;
 }
+// Daily maintenance base cost per aircraft class (continuous-upkeep model)
+const MAINT_BASE_DAY={Commuter:2e3,Turboprop:3e3,Regional:5e3,Narrowbody:9e3,Widebody:22e3,Large:28e3,Jumbo:34e3,Supersonic:30e3,Feeder:3e3,Classic:9e3,Medium:22e3,Heavy:34e3};
 
 const LEVELS = [0,75e6,150e6,300e6,600e6,1.2e9,2.5e9,5e9,10e9,20e9]; // net worth threshold for level i+1
 
@@ -3224,7 +3243,9 @@ const ACHIEVEMENTS = [
  {id:"pax500k",name:"500K Passengers",desc:"Carry 500,000 passengers",icon:"🌐"},
  {id:"nw500m",name:"$500M Net Worth",desc:"Reach $500M net worth",icon:"💰"},
  {id:"nw5b",name:"$5B Net Worth",desc:"Reach $5B net worth",icon:"🏦"},
- {id:"perfect_week",name:"Perfect Week",desc:"7 straight profitable days",icon:"🔥"}
+ {id:"perfect_week",name:"Perfect Week",desc:"7 straight profitable days",icon:"🔥"},
+ {id:"mach2",name:"Mach 2",desc:"Own a Concorde",icon:"🚀"},
+ {id:"consolidator",name:"Consolidator",desc:"Complete an acquisition",icon:"🤝"}
 ];
 
 const PATTERNS = ["solid","cheatline","swoosh","split","retro","tailfade","belly","wave"];

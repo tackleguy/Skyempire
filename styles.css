@@ -176,6 +176,76 @@ label{font-size:12px;color:var(--text2);display:block;margin-bottom:4px}
 .chart-tip{position:absolute;background:var(--raised);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:11px;pointer-events:none;white-space:nowrap;z-index:10}
 
 #confetti{position:fixed;inset:0;pointer-events:none;z-index:3000}
+
+/* UI refresh: stat cluster, elevation, hover lift, sticky headers */
+.stat-cluster{display:flex;align-items:center;background:var(--raised);border:1px solid var(--border);border-radius:999px;padding:4px 8px;gap:0;box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}
+.stat-cluster>*{border:none!important;background:none!important;border-radius:0!important;padding:2px 12px!important}
+.stat-cluster>*+*{border-left:1px solid var(--border)!important}
+.stat-cluster .tb-cash{padding:0 12px!important}
+.card,.fleet-card,.ach{box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}
+.fleet-card,.ach{transition:transform .12s ease,border-color .12s ease}
+.fleet-card:hover,.ach:not(.locked):hover{transform:translateY(-2px);border-color:var(--brand)}
+thead th{position:sticky;top:0;background:var(--surface);z-index:2}
+td:last-child,th:last-child{text-align:right}
+
+/* Incident set-piece (silhouette only) */
+.incident-scene{background:linear-gradient(#0a1020,#111A2E);border-radius:8px;overflow:hidden;margin-bottom:12px;animation:incident-pulse 2.4s ease-in-out infinite}
+@keyframes incident-pulse{0%,100%{box-shadow:inset 0 0 0 1px var(--border)}50%{box-shadow:inset 0 0 24px rgba(255,92,108,.35)}}
+.incident-plane{animation:incident-descend 5s linear infinite}
+@keyframes incident-descend{0%{transform:translate(40px,10px)}100%{transform:translate(300px,105px)}}
+.incident-trail{animation:incident-trail 5s linear infinite}
+@keyframes incident-trail{0%{opacity:0}25%{opacity:.7}100%{opacity:0;stroke-dashoffset:-60}}
+
+/* ============ Modern glass UI pass ============ */
+/* Sunset-above-clouds scene, rendered in pure CSS behind everything */
+body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
+  background:
+    radial-gradient(1100px 480px at 78% -6%, rgba(255,140,66,.20), transparent 60%),
+    radial-gradient(900px 420px at 88% 4%, rgba(255,94,120,.12), transparent 62%),
+    radial-gradient(1300px 700px at 12% 112%, rgba(77,163,255,.10), transparent 60%),
+    radial-gradient(700px 190px at 28% 86%, rgba(141,160,192,.07), transparent 70%),
+    radial-gradient(900px 220px at 68% 94%, rgba(141,160,192,.05), transparent 70%),
+    linear-gradient(180deg,#0a1424 0%,#0B1220 55%,#0a101d 100%)}
+#content,.screen{background:transparent}
+/* Frosted-glass surfaces */
+.card,.fleet-card,.ach,.modal,.wiz-card,.toast,.preview{
+  background:rgba(17,26,46,.62);
+  backdrop-filter:blur(16px) saturate(140%);
+  -webkit-backdrop-filter:blur(16px) saturate(140%);
+  border:1px solid rgba(130,158,210,.16);
+  border-radius:16px;
+  box-shadow:0 8px 32px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.05)}
+#topbar,#sidebar{
+  background:rgba(10,16,30,.72);
+  backdrop-filter:blur(18px) saturate(150%);
+  -webkit-backdrop-filter:blur(18px) saturate(150%)}
+.stat-cluster,.chip,.seg,.icon-btn,input[type=text],input[type=number],select,textarea,.hub-pick button,.dest-list,.ac-pick .item,.swatches button,.logo-grid button{
+  background:rgba(24,35,60,.55);border-color:rgba(130,158,210,.16)}
+.backdrop{backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+/* Gradient primary buttons with brand glow */
+.btn{border-radius:10px;transition:transform .12s ease,box-shadow .12s ease,border-color .12s ease;background:rgba(24,35,60,.6)}
+.btn:hover{transform:translateY(-1px)}
+.btn.primary{
+  background:linear-gradient(135deg,var(--brand),color-mix(in srgb,var(--brand),#fff 28%));
+  border:none;box-shadow:0 4px 18px color-mix(in srgb,var(--brand) 45%,transparent)}
+.btn.primary:hover{box-shadow:0 6px 24px color-mix(in srgb,var(--brand) 60%,transparent)}
+.btn.danger{background:linear-gradient(135deg,#FF5C6C,#ff8090);border:none}
+/* Nav: rounded active pill instead of edge bar */
+.nav-item{border-left:none;margin:2px 8px;border-radius:10px;height:44px}
+#sidebar.collapsed .nav-item{margin:2px 6px;justify-content:center;padding:0}
+.nav-item.active{background:linear-gradient(90deg,color-mix(in srgb,var(--brand) 22%,transparent),transparent);box-shadow:inset 2px 0 0 var(--brand)}
+/* Typography polish */
+h1{font-size:26px;letter-spacing:-0.02em}
+h3{letter-spacing:.01em}
+.tb-cash{text-shadow:0 0 18px color-mix(in srgb,var(--brand) 55%,transparent)}
+/* Tables inside glass cards */
+th{background:transparent!important;backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}
+tr:hover td{background:rgba(36,50,82,.45)}
+/* Modals & wizard pop a little more */
+.modal,.wiz-card{box-shadow:0 24px 80px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.06)}
+/* Map keeps solid tiles; give controls the glass look */
+.leaflet-popup-content-wrapper{background:rgba(17,26,46,.85);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-radius:12px}
+#mapSearch{background:rgba(17,26,46,.8);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-radius:12px}
 .muted{color:var(--muted)}
 .sub{color:var(--text2);font-size:12px}
 .mb{margin-bottom:16px}

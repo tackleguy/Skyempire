@@ -35,14 +35,22 @@ const weekday = day => (day-1)%7; // 0=Mon
 const DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 function crewRate(ac){
   if(ac.kind==="cargo") return (ac.model==="ATR 72F"||ac.model==="737-800BCF")?1400:2600;
-  return ["Widebody","Large","Jumbo"].includes(ac.cls)?2600:1400;
+  return ["Widebody","Large","Jumbo","Supersonic"].includes(ac.cls)?2600:1400;
 }
+// Continuous-maintenance model: daily upkeep per aircraft, never force-grounds
+function dailyUpkeep(a){
+  const spec=AC[a.model];
+  const condFactor=1+(100-a.condition)/100*0.6;
+  return (MAINT_BASE_DAY[spec.cls]||8e3)*condFactor*(1+maintSurcharge());
+}
+// Per-flight incident risk: 1 in 10,000 baseline, rising as condition drops below 70%
+function crashProb(a){ return 1e-4*(a.condition>=70?1:1+(70-a.condition)*0.2); }
 const isWide = ac => ["Widebody","Large","Jumbo"].includes(ac.cls);
 function fleetFamilies(){ return new Set(S.fleet.map(a=>FAMILY(a.model))).size; }
 function maintSurcharge(){ return Math.max(0,fleetFamilies()-3)*0.15; }
 // Runway physics: altitude-adjusted required runway; single source of truth
-const CLASS_MIN_RW={Turboprop:3600,Regional:5800,Narrowbody:6600,Widebody:8500,Large:9500,Jumbo:10000};
-const CLASS_ORDER=["Turboprop","Regional","Narrowbody","Widebody","Large","Jumbo"];
+const CLASS_MIN_RW={Commuter:1500,Turboprop:3600,Regional:5800,Narrowbody:6600,Widebody:8500,Large:9500,Jumbo:10000};
+const CLASS_ORDER=["Commuter","Turboprop","Regional","Narrowbody","Widebody","Large","Jumbo"];
 function reqRunwayFt(spec,ap){ return spec.minRunwayFt*(1+(ap.elev||0)/25000); }
 function canOperate(spec,ap){ return (ap.rw||0)>=reqRunwayFt(spec,ap); }
 function runwayReason(spec,ap){ return `Runway too short — needs ${fmtNum(reqRunwayFt(spec,ap))} ft (adj. for altitude), longest here is ${fmtNum(ap.rw||0)} ft`; }
@@ -65,7 +73,7 @@ function routeRating(r,acObj){
 function rivalNetwork(name){
   const rv=RIVALS.find(r=>r.name===name);
   const set=new Set([rv.base]);
-  rv.routes.concat(S.rivalExtra.filter(x=>x.airline===name).map(x=>x.pair)).forEach(p=>{set.add(p[0]);set.add(p[1]);});
+  rivalRoutesOf(rv).forEach(p=>{set.add(p[0]);set.add(p[1]);});
   return set;
 }
 
@@ -82,11 +90,14 @@ function defaultState(){
     fleet:[], nextAcId:1,
     routes:[], nextRouteId:1, flights:[],
     loans:[], globalMkt:false, image:50, interline:{},
+    sandbox:false, settings:{freq:"Normal",crashes:true}, news:[],
+    stock:{price:100,prev:100,sentiment:1,hist:[100],startNW:1e6},
+    firstAcId:1, rivalRemoved:[], rivalOwned:{},
     livery:{base:"#4DA3FF",accent:"#E8EEF9",tail:"#4DA3FF",pattern:"cheatline",logo:"bird",},
     level:1, ach:{}, stats:{pax:0,tonnes:0,profitStreak:0},
     today:{rev:0,revPax:0,revCargo:0,revBelly:0,fuel:0,crew:0,fees:0,maint:0,lease:0,overhead:0,marketing:0,interest:0,svc:0,interline:0,other:0},
     pnl:[], usedRolls:{},
-    events:{viralRoute:null,viralUntil:0,storm:null,stormDay:0},
+    events:{viralRoute:null,viralUntil:0,storm:null,stormDay:0,marketUntil:0,crashOk:15,mergerOk:20,dipUntil:0,dipApts:[]},
     rivalExtra:[], nextRivalDay:10,
     negDays:0, gameOver:false,
     hint:true, sideCollapsed:false,
@@ -111,6 +122,8 @@ function routeDemandMult(r){
   if(S.globalMkt) m*=1.05;
   if(S.events.viralRoute===r.id && S.day<=S.events.viralUntil) m*=1.8;
   m*=0.9+(S.image||50)/100*0.2; // airline image: 0.9–1.1
+  if(S.day<=(S.events.marketUntil||0)) m*=0.6;
+  if(S.day<=(S.events.dipUntil||0)&&(S.events.dipApts||[]).some(x=>x===r.from||x===r.to)) m*=0.75;
   for(const name in S.interline){
     if(!S.interline[name])continue;
     const net=rivalNetwork(name);
@@ -160,10 +173,9 @@ function legEcon(r, dir, acObj, opts={}){
   res.fuel=spec.fuel*dist*effFuelIdx();
   res.crew=crewRate(spec)*fh;
   res.fee=TIERS[AP[to].tier].landing;
-  const cond=acObj?acObj.condition:100;
-  res.maint=spec.maint*fh*(cond<70?2:1)*(1+maintSurcharge());
+  res.maint=0; // maintenance is a daily upkeep line now, not per-flight
   if(r.type==="pax")res.svc=SVC[effSvcTier(r,dist)].cost*(res.pax.e+1.5*res.pax.p+3*res.pax.b);
-  res.cost=res.fuel+res.crew+res.fee+res.maint+res.svc;
+  res.cost=res.fuel+res.crew+res.fee+res.svc;
   res.profit=res.rev-res.cost;
   return res;
 }
@@ -172,6 +184,8 @@ function dailyEcon(r,acObj){ // both directions × freq
   const sum={};
   for(const k of ["rev","revPax","revCargo","revBelly","fuel","crew","fee","maint","svc","cost","profit"]) sum[k]=(a[k]+b[k])*r.freq;
   sum.rating=Math.round((a.rating+b.rating)/2);
+  sum.maint=acObj?dailyUpkeep(acObj):0;
+  sum.cost+=sum.maint; sum.profit-=sum.maint;
   sum.pax=(a.pax.e+a.pax.p+a.pax.b+b.pax.e+b.pax.p+b.pax.b)*r.freq;
   sum.tonnes=(a.tonnes+b.tonnes)*r.freq;
   sum.load=r.type==="pax"?sum.pax/((a.seats+b.seats)*r.freq||1):sum.tonnes/((a.cap+b.cap)*r.freq||1);
@@ -200,6 +214,8 @@ function flashCash(v){
 function toast(title,msg,type="info"){
   const t=document.createElement("div");
   t.className="toast "+(type==="ok"?"ok":type==="bad"?"bad":type==="warn"?"warn":"");
+  const icons={ok:"💰",warn:"⚠️",bad:"⚠️",info:"📰"};
+  if(!/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(title))title=(icons[type]||"📰")+" "+title;
   t.innerHTML=`<b>${esc(title)}</b>${esc(msg)}`;
   $("#toasts").appendChild(t);
   setTimeout(()=>t.remove(),5000);
@@ -251,6 +267,8 @@ function checkAchievements(){
   if(nw>=500e6)award("nw500m");
   if(nw>=5e9)award("nw5b");
   if(S.stats.profitStreak>=7)award("perfect_week");
+  if(owned.some(a=>a.model==="Concorde"))award("mach2");
+  if((S.stats.acquisitions||0)>=1)award("consolidator");
 }
 function checkLevel(){
   const nw=netWorth();
@@ -258,6 +276,7 @@ function checkLevel(){
   if(lvl>S.level){ S.level=lvl; confetti(); toast("Level up! ✨","Your airline reached level "+lvl,"ok"); renderNav(); }
 }
 function gate(what){ // returns null if allowed, else message
+  if(S.sandbox)return null;
   const L=S.level;
   if(what.tier===4&&L<4)return "Tier-4 hubs unlock at level 4";
   if(what.tier===5&&L<7)return "Tier-5 hubs unlock at level 7";
@@ -265,6 +284,7 @@ function gate(what){ // returns null if allowed, else message
     if(a.cls==="Large"&&L<5)return "Large aircraft unlock at level 5";
     if(a.cls==="Jumbo"&&L<6)return "Jumbo aircraft unlock at level 6";
     if(a.cls==="Heavy"&&L<4)return "Heavy freighters unlock at level 4";
+    if(a.cls==="Supersonic"&&L<8)return "Concorde unlocks at level 8";
   }
   return null;
 }
@@ -378,7 +398,7 @@ function renderRouteLines(){
     RT.routeLines.push(l);
   }
   for(const rv of RIVALS){
-    for(const rr of rv.routes.concat(S.rivalExtra.filter(x=>x.airline===rv.name).map(x=>x.pair))){
+    for(const rr of rivalRoutesOf(rv)){
       const coords=arcCoords(rr[0],rr[1]).map(c=>[c[1],c[0]]);
       const l=L.polyline(coords,{color:rv.color,opacity:0.18,weight:1.5}).addTo(RT.map);
       RT.routeLines.push(l);
@@ -428,7 +448,7 @@ function updatePlanes(){
   // rivals
   let i=0;
   for(const rv of RIVALS){
-    const all=rv.routes.concat(S.rivalExtra.filter(x=>x.airline===rv.name).map(x=>x.pair));
+    const all=rivalRoutesOf(rv);
     for(const rr of all){
       const dist=distKm(rr[0],rr[1]);
       const dur=(dist/850+0.5)*60, period=2*(dur+45);
@@ -476,6 +496,7 @@ function tickMinutes(target){
       const f=S.flights[i];
       if(now>=f.dep+f.dur){ landFlight(f); S.flights.splice(i,1); }
     }
+    if(RT.pendingCrash){ const a=acById(RT.pendingCrash); RT.pendingCrash=null; if(a)planeCrash(a); }
     // departures
     for(const r of S.routes){
       const ac=acById(r.acId);
@@ -509,7 +530,7 @@ function landFlight(f){
   S.today.rev+=rev;
   S.today.revPax+=e.revPax; S.today.revCargo+=e.revCargo; S.today.revBelly+=e.revBelly;
   S.today.fuel+=e.fuel*(rev===0?0.5:1); S.today.crew+=e.crew*(rev===0?0.5:1);
-  S.today.fees+=e.fee*(rev===0?0.5:1); S.today.maint+=e.maint*(rev===0?0.5:1);
+  S.today.fees+=e.fee*(rev===0?0.5:1);
   S.today.svc+=e.svc*(rev===0?0.5:1);
   S.image=clamp((S.image||50)+(e.rating-(S.image||50))*0.02,0,100);
   r.profitToday=(r.profitToday||0)+rev-cost;
@@ -521,13 +542,14 @@ function landFlight(f){
   r.seatsToday=(r.seatsToday||0)+(r.type==="pax"?e.seats:e.cap);
   if(ac){
     ac.inFlight=false;
-    const decay=AC[ac.model].classic?0.25:0.15;
+    const decay=AC[ac.model].classic?0.20:0.12;
     ac.condition=Math.max(1,ac.condition-decay*e.fh);
     ac.hoursToday=(ac.hoursToday||0)+e.fh;
     ac.profitToday=(ac.profitToday||0)+rev-cost;
   }
   r.nextDep=f.dep+f.dur+45;
   flashCash(rev-cost);
+  if(S.settings.crashes&&ac&&Math.random()<crashProb(ac))RT.pendingCrash=ac.id;
 }
 function midnight(newDay){
   // post P&L for S.day
@@ -545,10 +567,20 @@ function midnight(newDay){
     if(r.loads.length>7)r.loads.shift();
     r.profitYest=r.profitToday||0; r.profitToday=0;
   }
+  let upkeep=0;
   for(const a of S.fleet){a.utilYest=Math.min(1,(a.hoursToday||0)/14);a.hoursToday=0;a.profitYest=a.profitToday||0;a.profitToday=0;
-    if(a.status==="overhaul"&&newDay>=a.statusUntil){a.status="ok";a.condition=100;toast("Overhaul complete",a.model+" back in service","ok");}
-    if((a.status==="grounded"||a.status==="charter")&&newDay>=a.statusUntil){a.status="ok";}
+    upkeep+=dailyUpkeep(a);
+    if(a.condition<92)a.condition=Math.min(92,a.condition+2);
+    if((a.status==="grounded"||a.status==="charter"||a.status==="overhaul")&&newDay>=a.statusUntil){a.status="ok";}
   }
+  // stock price
+  const st=S.stock;
+  if(S.stats.profitStreak===7)st.sentiment*=1.05;
+  if(S.negDays>0)st.sentiment*=0.97;
+  st.sentiment=clamp(st.sentiment*(1+rand(-0.03,0.03))+(1-st.sentiment)*0.05,0.7,1.3);
+  st.prev=st.price;
+  st.price=Math.max(1,100*Math.sqrt(Math.max(0.01,netWorth()/st.startNW))*st.sentiment);
+  st.hist.push(Math.round(st.price*100)/100); if(st.hist.length>60)st.hist.shift();
   S.day=newDay;
   S.today={rev:0,revPax:0,revCargo:0,revBelly:0,fuel:0,crew:0,fees:0,maint:0,lease:0,overhead:0,marketing:0,interest:0,svc:0,interline:0,other:0};
   // fuel walk
@@ -565,6 +597,7 @@ function midnight(newDay){
   S.today.marketing+=mkt; S.cash-=mkt;
   let ilFee=Object.values(S.interline).filter(Boolean).length*10e3;
   S.today.interline+=ilFee; S.cash-=ilFee;
+  S.today.maint+=upkeep; S.cash-=upkeep;
   let interest=S.loans.reduce((s,l)=>s+l.amount*0.0003,0);
   S.today.interest+=interest; S.cash-=interest;
   // used market rolls
@@ -573,9 +606,10 @@ function midnight(newDay){
   // events
   rollEvent();
   // rivals
-  if(S.day>=S.nextRivalDay&&S.rivalExtra.length<RIVAL_CANDIDATES.length){
+  const aliveRivals=RIVALS.filter(rv=>!(S.rivalOwned&&S.rivalOwned[rv.name]));
+  if(S.day>=S.nextRivalDay&&S.rivalExtra.length<RIVAL_CANDIDATES.length&&aliveRivals.length){
     const cand=RIVAL_CANDIDATES[S.rivalExtra.length];
-    const rv=pick(RIVALS);
+    const rv=pick(aliveRivals);
     S.rivalExtra.push({airline:rv.name,pair:cand});
     S.nextRivalDay=S.day+9+Math.floor(rand(0,4));
     toast("Rival expansion",rv.name+" opened "+cand[0]+"–"+cand[1]);
@@ -590,29 +624,189 @@ function midnight(newDay){
   save();
   if(currentScreen()!=="map")renderScreen(currentScreen());
 }
+function pushNews(icon,title,msg){
+  S.news.unshift({d:S.day,min:Math.floor(S.t%1440),icon,title,msg});
+  if(S.news.length>100)S.news.pop();
+  if(currentScreen()==="news")renderNews();
+}
+function eventMult(){ return S.settings.freq==="Calm"?0.5:S.settings.freq==="Chaotic"?2:1; }
+function rivalRoutesOf(rv){
+  const removed=new Set(S.rivalRemoved||[]);
+  return rv.routes.concat(S.rivalExtra.filter(x=>x.airline===rv.name).map(x=>x.pair))
+    .filter(p=>!removed.has(p[0]+"-"+p[1]));
+}
 function rollEvent(){
-  if(Math.random()>0.25)return;
-  const type=pick(["fuel","storm","viral","maint","vip"]);
-  if(type==="fuel"){
-    S.spikeMult=1+rand(0.08,0.15); S.spikeUntil=S.day+2;
-    toast("Fuel spike ⛽","Fuel prices up "+Math.round((S.spikeMult-1)*100)+"% for 3 days","warn");
-  }else if(type==="storm"&&S.routes.length){
-    const apts=[...new Set(S.routes.flatMap(r=>[r.from,r.to]))];
-    S.events.storm=pick(apts); S.events.stormDay=S.day;
-    toast("Storm ⛈️","Severe weather at "+S.events.storm+" — today's flights earn nothing","bad");
-  }else if(type==="viral"&&S.routes.length){
-    const r=pick(S.routes);
-    S.events.viralRoute=r.id; S.events.viralUntil=S.day+1;
-    toast("Viral route 🔥",r.from+"–"+r.to+" demand ×1.8 for 2 days","ok");
-  }else if(type==="maint"){
-    const cands=S.fleet.filter(a=>a.condition<80&&a.status==="ok");
-    if(cands.length){const a=pick(cands);a.status="grounded";a.statusUntil=S.day+1;
-      toast("Maintenance issue 🔧",a.model+" grounded for the day","warn");}
-  }else if(type==="vip"){
-    const cands=S.fleet.filter(a=>a.status==="ok");
-    if(cands.length)vipOffer(pick(cands));
+  const em=eventMult();
+  if(Math.random()<0.25*em){
+    const type=pick(["fuel","storm","viral","vip"]);
+    if(type==="fuel"){
+      S.spikeMult=1+rand(0.08,0.15); S.spikeUntil=S.day+2;
+      toast("Fuel spike ⛽","Fuel prices up "+Math.round((S.spikeMult-1)*100)+"% for 3 days","warn");
+      pushNews("⛽","Fuel spike","Global fuel prices up "+Math.round((S.spikeMult-1)*100)+"% for 3 days");
+    }else if(type==="storm"&&S.routes.length){
+      const apts=[...new Set(S.routes.flatMap(r=>[r.from,r.to]))];
+      S.events.storm=pick(apts); S.events.stormDay=S.day;
+      toast("Storm ⛈️","Severe weather at "+S.events.storm+" — today's flights earn nothing","bad");
+      pushNews("⛈️","Storm at "+S.events.storm,"All flights there today earn no revenue");
+    }else if(type==="viral"&&S.routes.length){
+      const r=pick(S.routes);
+      S.events.viralRoute=r.id; S.events.viralUntil=S.day+1;
+      toast("Viral route 🔥",r.from+"–"+r.to+" demand ×1.8 for 2 days","ok");
+      pushNews("🔥","Viral route",r.from+"–"+r.to+" demand ×1.8 for 2 days");
+    }else if(type==="vip"){
+      const cands=S.fleet.filter(a=>a.status==="ok");
+      if(cands.length)vipOffer(pick(cands));
+    }
   }
+  if(S.day>=(S.events.crashOk||0)&&Math.random()<0.02*em)marketCrash();
+  if(netWorth()>300e6&&S.day>=(S.events.mergerOk||0)&&Math.random()<0.03*em)mergerOffer();
   updateBanner();
+}
+function marketCrash(){
+  S.events.marketUntil=S.day+4+Math.floor(rand(1,4));
+  S.events.crashOk=S.day+30;
+  S.fuelIdx=clamp(S.fuelIdx*0.9,0.75,1.45);
+  S.stock.sentiment=Math.max(0.7,S.stock.sentiment*0.75);
+  toast("Market crash 📉","Global demand ×0.6 until day "+S.events.marketUntil,"bad");
+  pushNews("📉","Market crash","Demand ×0.6 until day "+S.events.marketUntil+"; fuel −10%; investor sentiment −25%");
+  openModal(`<h2>📉 Market Crash</h2>
+    <canvas id="mcCv" width="512" height="200" style="width:100%;border-radius:8px;background:#08101e"></canvas>
+    <p class="mb" style="margin-top:12px">Global markets are plunging. Travel demand drops to <b>60%</b> until day ${S.events.marketUntil}. Fuel is 10% cheaper — small mercy. Your share price takes a hit.</p>
+    <button class="btn primary" onclick="closeModal()">Weather the storm</button>`);
+  const cv=$("#mcCv"),ctx=cv.getContext("2d");
+  const candles=Array.from({length:24},(_,i)=>({x:i*22+8,y:30+i*5+rand(-8,8)}));
+  let t0=null;
+  (function anim(ts){
+    if(!document.getElementById("mcCv"))return;
+    t0=t0||ts; const t=(ts-t0)/1000;
+    ctx.clearRect(0,0,512,200);
+    ctx.globalAlpha=0.25+0.1*Math.sin(t*6);
+    ctx.fillStyle="#FF5C6C"; ctx.fillRect(0,0,512,200); ctx.globalAlpha=1;
+    candles.forEach((c,i)=>{
+      const drop=(t*30+i*4)%40;
+      ctx.fillStyle="#FF5C6C";
+      ctx.fillRect(c.x,c.y+drop,10,26); ctx.fillRect(c.x+4,c.y+drop-8,2,42);
+    });
+    ctx.strokeStyle="#E8EEF9"; ctx.lineWidth=2; ctx.beginPath();
+    for(let x=0;x<=512;x+=16){const y=20+x*0.28+Math.sin(x*0.15+t*3)*9+((x/512)*t*8)%30;ctx.lineTo(x,Math.min(y,196));}
+    ctx.stroke();
+    ctx.fillStyle="#8DA0C0"; ctx.font="11px monospace";
+    const tape="SKY -34%  AER -28%  JET -41%  FLY -22%  WNG -37%  ALT -19%  ";
+    const off=(t*60)%400;
+    ctx.fillText(tape+tape,-off,192);
+    requestAnimationFrame(anim);
+  })(performance.now());
+}
+function planeCrash(a){
+  if(!a)return;
+  const routes=S.routes.filter(r=>r.acId===a.id);
+  const dipApts=[...new Set(routes.flatMap(r=>[r.from,r.to]))];
+  routes.forEach(r=>deleteRoute(r.id,true));
+  S.fleet=S.fleet.filter(x=>x.id!==a.id);
+  S.cash-=8e6; S.today.other+=8e6;
+  S.stock.sentiment=Math.max(0.7,S.stock.sentiment*0.85);
+  S.events.dipApts=dipApts; S.events.dipUntil=S.day+3;
+  pushNews("🕯️","Incident: aircraft lost","A "+a.model+" was lost in an accident. Settlement $8M; demand dip on affected airports for 3 days");
+  openModal(`<h2 style="color:var(--bad)">Incident Report</h2>
+    <div class="incident-scene">
+      <svg viewBox="0 0 512 180" style="width:100%">
+        <rect x="0" y="150" width="512" height="2" fill="#243252"/>
+        <circle cx="440" cy="40" r="18" fill="#18233C"/>
+        <g class="incident-plane">
+          <path transform="scale(1.6) rotate(18)" fill="#0B1220" stroke="#5A6B8C" stroke-width="0.6" d="M12 2c.4 0 .8.3.9.8l.6 6.7 8 2.8v1.9l-8-1-.5 6.3 2.6 1.7v1.4L12 21.8l-3.6.8v-1.4l2.6-1.7-.5-6.3-8 1v-1.9l8-2.8.6-6.7c.1-.5.5-.8.9-.8z"/>
+        </g>
+        <line class="incident-trail" x1="60" y1="30" x2="200" y2="80" stroke="#5A6B8C" stroke-width="2" stroke-dasharray="6 8"/>
+      </svg>
+    </div>
+    <p class="mb">One of our aircraft, a <b>${esc(a.model)}</b>, has been lost. All operations on its routes are suspended. Our thoughts are with everyone affected.</p>
+    <p class="mb sub">Effects: aircraft removed · $8M settlement · reputation −15% (recovers) · 3-day demand dip nearby.</p>
+    <div class="row">
+      <button class="btn primary" id="crStmt">Issue public statement (−$2M, halves reputation hit)</button>
+      <button class="btn" id="crStd">Standard response</button>
+    </div>`);
+  $("#crStmt").onclick=()=>{S.cash-=2e6;S.today.other+=2e6;S.stock.sentiment=Math.min(1.3,S.stock.sentiment/0.85*0.925);pushNews("🎙️","Public statement issued","Leadership addressed the incident directly; reputation partially restored");closeModal();save();};
+  $("#crStd").onclick=()=>{closeModal();save();};
+  if(currentScreen()==="fleet")renderFleet();
+  renderRouteLines();
+}
+function acquireBundle(rv,pairs,nAc,model,price){
+  S.cash-=price;S.today.other+=price;
+  const newAcs=[];
+  for(let i=0;i<nAc;i++){const id=S.nextAcId++;newAcs.push(id);
+    S.fleet.push({id,model,hub:S.mainHub,condition:Math.round(rand(75,88)),biz:0,prem:0,leased:false,inFlight:false,status:"ok",statusUntil:0,hoursToday:0,profitToday:0});}
+  pairs.forEach((p,i)=>{
+    if(S.routes.some(r=>(r.from===p[0]&&r.to===p[1])||(r.from===p[1]&&r.to===p[0])))return;
+    const spec=AC[model];
+    const cap=freqCap(flightHours(distKm(p[0],p[1]),spec.speed));
+    S.routes.push({id:S.nextRouteId++,type:"pax",from:p[0],to:p[1],acId:newAcs[i%newAcs.length],acModel:model,freq:Math.min(2,cap),m:1,svc:1,marketing:false,loads:[],legsToday:0,dayRef:S.day,nextDep:Math.max(S.t,(S.day-1)*1440+360),bellyUsedToday:0,profitToday:0,paxToday:0,seatsToday:0});
+  });
+  S.rivalRemoved=(S.rivalRemoved||[]).concat(pairs.map(p=>p[0]+"-"+p[1]));
+  RT.rivalMarkers.forEach(m=>m&&RT.map&&RT.map.removeLayer(m));RT.rivalMarkers=[];
+  S.stock.sentiment=Math.min(1.3,S.stock.sentiment*1.10);
+  S.stats.acquisitions=(S.stats.acquisitions||0)+1;
+  checkAchievements();renderRouteLines();renderAirportMarkers();save();
+}
+window.proposeMerger=function(name){
+  const rv=RIVALS.find(r=>r.name===name);
+  const pairs=rivalRoutesOf(rv);
+  if(!pairs.length)return;
+  const nAc=pairs.length+2, model=pick(["A320neo","737 MAX 8","A321neo"]);
+  const price=Math.round(120e6+pairs.length*38e6);
+  openModal(`<h2>🤝 Acquire ${esc(name)}?</h2>
+    <p class="mb">Full buyout: their <b>${pairs.length} routes</b> (${pairs.map(p=>p.join("–")).join(", ")}) plus <b>${nAc}× ${model}</b> join your network for <b>${fmtMoney(price)}</b>.</p>
+    <p class="sub mb">${esc(name)} exits the market. Sentiment +10%.</p>
+    <div class="row"><button class="btn primary" id="pmYes" ${S.cash<price?"disabled":""}>Acquire</button><button class="btn" onclick="closeModal()">Cancel</button></div>`);
+  $("#pmYes").onclick=()=>{
+    acquireBundle(rv,pairs,nAc,model,price);
+    S.rivalOwned=S.rivalOwned||{};S.rivalOwned[name]=true;
+    delete S.interline[name];
+    pushNews("🤝","Merger completed",S.airline+" acquired "+name+" for "+fmtMoney(price));
+    toast("Merger complete 🤝",name+" is now part of "+S.airline,"ok");
+    closeModal();renderAirports();
+  };
+};
+function mergerOffer(){
+  S.events.mergerOk=S.day+20;
+  const buying=Math.random()<0.6||S.routes.length<2;
+  let html,onAccept;
+  if(buying){
+    const rv=RIVALS.map(r=>({r,routes:rivalRoutesOf(r)})).filter(x=>x.routes.length>=3)[0];
+    if(!rv)return;
+    const pairs=rv.routes.slice(0,4);
+    const model=pick(["A320neo","737 MAX 8","A321neo"]);
+    const nAc=pairs.length+1;
+    const price=Math.round(AC[model].price*0.72*nAc+pairs.length*12e6);
+    html=`<h2>🤝 Acquisition Offer</h2>
+      <p class="mb"><b>${esc(rv.r.name)}</b> is divesting: <b>${nAc}× ${model}</b> and <b>${pairs.length} routes</b> (${pairs.map(p=>p.join("–")).join(", ")}) for <b>${fmtMoney(price)}</b>.</p>
+      <p class="sub mb">Aircraft arrive in your livery at ~80% condition. Routes start immediately. Sentiment +10%.</p>`;
+    onAccept=()=>{
+      if(S.cash<price){toast("Can't afford it","You need "+fmtMoney(price),"warn");return;}
+      acquireBundle(rv.r,pairs,nAc,model,price);
+      pushNews("🤝","Acquisition completed","Bought "+nAc+" aircraft and "+pairs.length+" routes from "+rv.r.name+" for "+fmtMoney(price));
+      toast("Acquisition complete 🤝",nAc+" aircraft + "+pairs.length+" routes joined your network","ok");
+      closeModal();
+    };
+  }else{
+    const sell=S.routes.slice().sort((x,y)=>(y.profitYest||0)-(x.profitYest||0)).slice(0,2);
+    const offer=Math.round(sell.reduce((s,r)=>s+Math.max(3e6,(r.profitYest||0)*30),0)+8e6);
+    html=`<h2>🤝 Buyout Offer</h2>
+      <p class="mb">A rival wants to buy your route${sell.length>1?"s":""} <b>${sell.map(r=>r.from+"–"+r.to).join(", ")}</b> for <b>${fmtMoney(offer)}</b> (a premium over ~30 days of profit). Your aircraft are freed up.</p>`;
+    onAccept=()=>{
+      sell.forEach(r=>deleteRoute(r.id,true));
+      S.cash+=offer;flashCash(offer);
+      S.stock.sentiment=Math.min(1.3,S.stock.sentiment*1.03);
+      pushNews("🤝","Routes sold","Sold "+sell.length+" route(s) for "+fmtMoney(offer));
+      toast("Routes sold 🤝",fmtMoney(offer)+" received","ok");
+      closeModal();save();
+    };
+  }
+  let remaining=30;
+  openModal(html+`<div class="row"><button class="btn primary" id="mgYes">Accept</button><button class="btn" id="mgNo">Decline</button><span class="sub" id="mgTimer">30s to decide</span></div>`);
+  const iv=setInterval(()=>{remaining--;const el=$("#mgTimer");if(el)el.textContent=remaining+"s to decide";
+    if(remaining<=0){clearInterval(iv);closeModal();pushNews("🤝","Offer expired","The merger offer lapsed");}},1000);
+  $("#mgYes").onclick=()=>{clearInterval(iv);onAccept();};
+  $("#mgNo").onclick=()=>{clearInterval(iv);closeModal();};
+  pushNews("🤝","Merger offer received",buying?"A rival offered to sell you a bundle":"A rival wants to buy routes from you");
 }
 function vipOffer(a){
   const hours=Math.round(rand(4,12));
@@ -624,7 +818,7 @@ function vipOffer(a){
     <div class="row"><button class="btn primary" id="vipYes">Accept</button><button class="btn" id="vipNo">Decline</button><span class="sub" id="vipTimer">30s to decide</span></div>`);
   const iv=setInterval(()=>{remaining--;const el=$("#vipTimer");if(el)el.textContent=remaining+"s to decide";
     if(remaining<=0){clearInterval(iv);closeModal();toast("Charter expired","The VIP offer lapsed");}},1000);
-  $("#vipYes").onclick=()=>{clearInterval(iv);a.status="charter";a.statusUntil=S.day+1;S.cash+=pay;S.today.rev+=pay;S.today.revPax+=pay;flashCash(pay);toast("Charter accepted",fmtMoney(pay)+" earned","ok");closeModal();save();};
+  $("#vipYes").onclick=()=>{clearInterval(iv);a.status="charter";a.statusUntil=S.day+1;S.cash+=pay;S.today.rev+=pay;S.today.revPax+=pay;flashCash(pay);toast("Charter accepted",fmtMoney(pay)+" earned","ok");pushNews("🥂","VIP charter flown",a.model+" chartered for "+fmtMoney(pay));closeModal();save();};
   $("#vipNo").onclick=()=>{clearInterval(iv);closeModal();};
 }
 function updateBanner(){
@@ -662,7 +856,12 @@ function loop(now){
 
 // ---------- Topbar ----------
 function renderTopbar(){
-  $("#tbCash").textContent=fmtMoney(S.cash);
+  if(RT.dispCash===undefined)RT.dispCash=S.cash;
+  RT.dispCash+=(S.cash-RT.dispCash)*0.45; // ~400ms count-up at 4 ticks/s
+  if(Math.abs(S.cash-RT.dispCash)<1000)RT.dispCash=S.cash;
+  $("#tbCash").textContent=fmtMoney(RT.dispCash);
+  const st=S.stock, chg=st.prev?((st.price/st.prev)-1)*100:0;
+  $("#tbStock").innerHTML=`${S.code||"SKY"} $${st.price.toFixed(2)} <span class="${chg>=0?"pos":"neg"}">${chg>=0?"▲":"▼"}${Math.abs(chg).toFixed(1)}%</span>`;
   const t=S.today;
   const net=t.rev-(t.fuel+t.crew+t.fees+t.maint+t.lease+t.overhead+t.marketing+t.interest+(t.svc||0)+(t.interline||0)+t.other);
   $("#tbPnl").innerHTML=`Today <span class="${net>=0?"pos":"neg"}">${fmtMoney(net)}</span>`;
@@ -673,7 +872,7 @@ function renderTopbar(){
 }
 
 // ---------- Navigation / screens ----------
-const NAV=[["map","Map","M3 12l7-9v5c8 0 11 5 11 9-3-3-6-4-11-4v5l-7-6z"],["fleet","Fleet","M21 16v-2l-8-5V3.5a1.5 1.5 0 00-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"],["routes","Routes","M4 18a3 3 0 106 0c0-1-1-2-3-4s-3-3-3-4a3 3 0 116 0h4a3 3 0 106 0"],["airports","Airports","M12 2a7 7 0 00-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 00-7-7zm0 9.5A2.5 2.5 0 1112 6.5a2.5 2.5 0 010 5z"],["finances","Finances","M4 20h16M6 16l4-6 4 3 4-8"],["livery","Livery Studio","M12 2l2.4 7.2H22l-6 4.4 2.3 7.2L12 16.4 5.7 20.8 8 13.6 2 9.2h7.6z"],["achievements","Achievements","M7 3h10v5a5 5 0 01-10 0V3zM5 5H2a4 4 0 004 4M19 5h3a4 4 0 01-4 4M12 13v4m-4 4h8"]];
+const NAV=[["map","Map","M3 12l7-9v5c8 0 11 5 11 9-3-3-6-4-11-4v5l-7-6z"],["fleet","Fleet","M21 16v-2l-8-5V3.5a1.5 1.5 0 00-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"],["routes","Routes","M4 18a3 3 0 106 0c0-1-1-2-3-4s-3-3-3-4a3 3 0 116 0h4a3 3 0 106 0"],["airports","Airports","M12 2a7 7 0 00-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 00-7-7zm0 9.5A2.5 2.5 0 1112 6.5a2.5 2.5 0 010 5z"],["finances","Finances","M4 20h16M6 16l4-6 4 3 4-8"],["news","News","M4 5h13v14H4a2 2 0 01-2-2V7a2 2 0 012-2zm13 3h3v9a2 2 0 01-2 2M6 9h7M6 12h7M6 15h5"],["livery","Livery Studio","M12 2l2.4 7.2H22l-6 4.4 2.3 7.2L12 16.4 5.7 20.8 8 13.6 2 9.2h7.6z"],["achievements","Achievements","M7 3h10v5a5 5 0 01-10 0V3zM5 5H2a4 4 0 004 4M19 5h3a4 4 0 01-4 4M12 13v4m-4 4h8"]];
 function renderNav(){
   $("#nav").innerHTML=NAV.map(([id,label,path])=>
     `<div class="nav-item${currentScreen()===id?" active":""}" data-nav="${id}">
@@ -696,8 +895,18 @@ function renderScreen(id){
   else if(id==="routes")renderRoutes();
   else if(id==="airports")renderAirports();
   else if(id==="finances")renderFinances();
+  else if(id==="news")renderNews();
   else if(id==="livery")renderLivery();
   else if(id==="achievements")renderAch();
+}
+function renderNews(){
+  const fmt=n=>`Day ${n.d} · ${String(Math.floor(n.min/60)).padStart(2,"0")}:${String(n.min%60).padStart(2,"0")}`;
+  $("#screen-news").innerHTML=`<div class="inner"><h1>News & Events</h1>
+    ${S.news.length?S.news.map(n=>`<div class="card mb" style="padding:14px 20px;display:flex;gap:14px;align-items:flex-start">
+      <span style="font-size:22px">${n.icon}</span>
+      <div style="flex:1"><div class="spread"><b>${esc(n.title)}</b><span class="sub">${fmt(n)}</span></div>
+      <span class="sub">${esc(n.msg)}</span></div></div>`).join(""):
+    `<div class="card">Nothing has happened yet. Events, deals and incidents will appear here.</div>`}</div>`;
 }
 
 // ---------- Fleet screen ----------
@@ -746,39 +955,33 @@ const LOGO_PATHS={
 };
 function renderFleet(){
   const el=$("#screen-fleet");
-  const cards=S.fleet.map(a=>{
+  const fq=(el.dataset.q||"").toLowerCase();
+  const cards=S.fleet.filter(a=>!fq||a.model.toLowerCase().includes(fq)||a.hub.toLowerCase().includes(fq)).map(a=>{
     const spec=AC[a.model];
     const cfg=seatCfg(a);
-    const status=a.status==="ok"?(a.inFlight?"In flight":"Ready"):a.status==="overhaul"?"Overhaul (day "+a.statusUntil+")":a.status==="charter"?"On charter":"Grounded";
+    const status=a.status==="ok"?(a.inFlight?"In flight":"Ready"):a.status==="charter"?"On charter":"Grounded";
     const sellVal=spec.price*0.6*(a.condition/100);
     return `<div class="fleet-card">
       ${fuselageSVG(S.livery,{w:400,h:110,retro:spec.classic,uid:a.id,name:S.code})}
       <div class="fleet-title">${esc(a.model)} ${spec.classic?'<span class="badge classic">CLASSIC</span>':""}${a.leased?'<span class="badge">LEASED</span>':""}${spec.kind==="cargo"?'<span class="badge">📦 FREIGHTER</span>':""}</div>
       <div class="fleet-meta">Base ${a.hub} · ${status} · ${spec.kind==="cargo"?spec.cap+"t payload":cfg.e+"E/"+cfg.p+"P/"+cfg.b+"B seats"} · min rwy ${fmtNum(spec.minRunwayFt)} ft</div>
-      <div class="fleet-stats"><span>Condition ${Math.round(a.condition)}%</span><span>Util ${Math.round((a.utilYest||0)*100)}%</span><span>Today <span class="${(a.profitToday||0)>=0?"pos":"neg"}">${fmtMoney(a.profitToday||0)}</span></span></div>
+      <div class="fleet-stats"><span>Condition ${Math.round(a.condition)}%</span><span>Upkeep ${fmtMoney(dailyUpkeep(a))}/day</span><span>Today <span class="${(a.profitToday||0)>=0?"pos":"neg"}">${fmtMoney(a.profitToday||0)}</span></span></div>
       <div class="bar"><i style="width:${a.condition}%;background:${condColor(a.condition)}"></i></div>
       ${spec.kind==="cargo"?`<div class="sub" style="margin-top:6px">Payload</div><div class="bar"><i style="width:100%;background:var(--info)"></i></div>`:""}
       <div class="fleet-actions">
         ${spec.kind!=="cargo"?`<button class="btn sm" onclick="openSeatConfig(${a.id})">Seat Config</button>`:""}
         <button class="btn sm" onclick="openReassign(${a.id})">Reassign Hub</button>
-        <button class="btn sm" onclick="doOverhaul(${a.id})" ${a.status!=="ok"||S.cash<spec.price*0.04?"disabled":""}>Overhaul ${fmtMoney(spec.price*0.04)}</button>
         <button class="btn sm danger" onclick="sellAc(${a.id})">${a.leased?"Return":"Sell "+fmtMoney(sellVal)}</button>
       </div></div>`;
   }).join("");
   const fam=fleetFamilies(), sur=maintSurcharge();
   el.innerHTML=`<div class="inner"><div class="spread mb"><h1 style="margin:0">Fleet</h1>
-    <div class="row"><span class="chip" title="Distinct aircraft families — first 3 are free, each extra adds +15% maintenance fleet-wide">🔧 ${fam} maint. ${fam===1?"family":"families"}${sur>0?` · <span class="neg">+${Math.round(sur*100)}% maint</span>`:" (3 free)"}</span>
+    <div class="row"><input type="text" id="fleetQ" placeholder="Filter fleet…" value="${esc(el.dataset.q||"")}" style="width:170px">
+    <span class="chip" title="Distinct aircraft families — first 3 are free, each extra adds +15% maintenance fleet-wide">🔧 ${fam} maint. ${fam===1?"family":"families"}${sur>0?` · <span class="neg">+${Math.round(sur*100)}% maint</span>`:" (3 free)"}</span>
     <button class="btn primary" onclick="openBuyModal()">Buy Aircraft</button></div></div>
     ${S.fleet.length?`<div class="grid3">${cards}</div>`:`<div class="card">No aircraft yet. Buy your first plane to get started.</div>`}</div>`;
+  $("#fleetQ").oninput=e=>{el.dataset.q=e.target.value;renderFleet();const v=$("#fleetQ");v.focus();v.setSelectionRange(v.value.length,v.value.length);};
 }
-window.doOverhaul=function(id){
-  const a=acById(id),spec=AC[a.model];
-  const r=S.routes.find(r=>r.acId===id);
-  spend(spec.price*0.04,"maint");
-  a.status="overhaul"; a.statusUntil=S.day+2;
-  toast("Overhaul started",a.model+" out of service for 2 days"+(r?" — route "+r.from+"–"+r.to+" paused":""));
-  renderFleet(); save();
-};
 window.sellAc=function(id){
   const a=acById(id),spec=AC[a.model];
   const r=S.routes.find(r=>r.acId===id);
@@ -879,7 +1082,8 @@ window.buyAc=function(model,leased,force){
 // ---------- Routes screen ----------
 function renderRoutes(){
   const el=$("#screen-routes");
-  const rows=S.routes.map(r=>{
+  const rq=(el.dataset.q||"").toLowerCase();
+  const rows=S.routes.filter(r=>!rq||(r.from+r.to+" "+r.acModel).toLowerCase().includes(rq)).map(r=>{
     const ac=acById(r.acId);
     const d=ac?dailyEcon(r,ac):null;
     const avgLoad=r.loads&&r.loads.length?r.loads.reduce((a,b)=>a+b,0)/r.loads.length:(d?d.load:0);
@@ -898,11 +1102,13 @@ function renderRoutes(){
   el.innerHTML=`<div class="inner">
     <div class="spread mb"><h1 style="margin:0">Routes</h1>
       <div class="row">
+        <input type="text" id="routesQ" placeholder="Filter routes…" value="${esc(el.dataset.q||"")}" style="width:150px">
         <button class="btn ${S.globalMkt?"primary":""}" onclick="toggleGlobalMkt()">${S.globalMkt?"✓ ":""}Brand Campaign $150K/day</button>
         <button class="btn primary" onclick="openRouteWizard()">New Route</button>
       </div></div>
     ${S.routes.length?`<div class="card" style="padding:0 8px"><table><thead><tr><th></th><th>Route</th><th>Aircraft</th><th>Freq</th><th>Price</th><th>Rating</th><th>Load (7d)</th><th>Daily profit</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`:
     `<div class="card">No routes yet. Open your first route to start earning.</div>`}</div>`;
+  $("#routesQ").oninput=e=>{el.dataset.q=e.target.value;renderRoutes();const v=$("#routesQ");v.focus();v.setSelectionRange(v.value.length,v.value.length);};
 }
 window.toggleGlobalMkt=function(){S.globalMkt=!S.globalMkt;toast("Brand campaign",S.globalMkt?"Active: +5% demand on all routes":"Stopped");renderRoutes();save();};
 window.deleteRoute=function(id,silent){
@@ -1083,8 +1289,8 @@ function renderAirports(){
   const shown=rows.slice(0,300);
   const myModels=[...new Set(S.fleet.map(a=>a.model))];
   const rivalRows=[{name:S.airline+" (you)",code:S.code,color:S.livery.base,fleet:S.fleet.length,routes:S.routes.length,base:S.mainHub}]
-    .concat(RIVALS.map(rv=>{const extra=S.rivalExtra.filter(x=>x.airline===rv.name).length;
-      return {name:rv.name,code:rv.code,color:rv.color,fleet:rv.routes.length+extra+4,routes:rv.routes.length+extra,base:rv.base};}));
+    .concat(RIVALS.map(rv=>{const n=rivalRoutesOf(rv).length;
+      return {name:rv.name,code:rv.code,color:rv.color,fleet:n+4,routes:n,base:rv.base};}));
   el.innerHTML=`<div class="inner"><h1>Airports <span class="sub">${fmtNum(total)} worldwide</span></h1>
     <div class="row mb"><input type="text" id="apSearch" placeholder="Search ${fmtNum(total)} airports…" value="${esc(el.dataset.q||"")}" style="max-width:320px">
     <span class="chip">Can host: <select id="apHost" style="width:auto;padding:2px 6px;font-size:12px">${['<option value="">any aircraft</option>'].concat(myModels.map(m=>`<option ${hostModel===m?"selected":""}>${m}</option>`)).join("")}</select></span></div>
@@ -1094,10 +1300,14 @@ function renderAirports(){
       ${rows.length>300?`<p class="sub" style="padding:8px 10px">Showing 300 of ${fmtNum(rows.length)} — refine your search.</p>`:""}</div>
     <h3>Airlines</h3>
     <p class="sub mb">Interlining links your network with a partner's: +10% demand on your routes touching their airports. $250K to sign, $10K/day to maintain.</p>
-    <div class="card" style="padding:0 8px"><table><thead><tr><th>Airline</th><th>Code</th><th>Base</th><th>Fleet</th><th>Routes</th><th>Interlining</th></tr></thead>
-      <tbody>${rivalRows.map((r,i)=>`<tr><td><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${r.color};margin-right:8px"></span><b>${esc(r.name)}</b></td><td>${r.code}</td><td>${r.base}</td><td>${r.fleet}</td><td>${r.routes}</td><td>${i===0?"—":
+    <div class="card" style="padding:0 8px"><table><thead><tr><th>Airline</th><th>Code</th><th>Base</th><th>Fleet</th><th>Routes</th><th>Interlining</th><th>Merger</th></tr></thead>
+      <tbody>${rivalRows.map((r,i)=>{
+        const owned=S.rivalOwned&&S.rivalOwned[r.name];
+        const price=Math.round(120e6+r.routes*38e6);
+        return `<tr><td><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${r.color};margin-right:8px"></span><b>${esc(r.name)}</b>${owned?' <span class="badge brand">ACQUIRED</span>':""}</td><td>${r.code}</td><td>${r.base}</td><td>${owned?"—":r.fleet}</td><td>${owned?"—":r.routes}</td><td>${i===0||owned?"—":
         S.interline[r.name]?`<span class="badge ok">ACTIVE</span> <button class="btn sm" onclick="toggleInterline('${esc(r.name)}')">Cancel</button>`:
-        `<button class="btn sm primary" onclick="toggleInterline('${esc(r.name)}')" ${S.cash<250e3?"disabled":""}>Sign $250K</button>`}</td></tr>`).join("")}</tbody></table></div></div>`;
+        `<button class="btn sm primary" onclick="toggleInterline('${esc(r.name)}')" ${S.cash<250e3?"disabled":""}>Sign $250K</button>`}</td><td>${i===0?"—":owned?"✓":
+        `<button class="btn sm" onclick="proposeMerger('${esc(r.name)}')" ${S.cash<price||!r.routes?"disabled":""}>Buy out ${fmtMoney(price)}</button>`}</td></tr>`;}).join("")}</tbody></table></div></div>`;
   $("#apSearch").oninput=e=>{el.dataset.q=e.target.value;renderAirports();$("#apSearch").focus();const v=$("#apSearch");v.setSelectionRange(v.value.length,v.value.length);};
   $("#apHost").onchange=e=>{el.dataset.host=e.target.value;renderAirports();};
   window.toggleInterline=function(name){
@@ -1148,6 +1358,13 @@ function renderFinances(){
       <div class="card"><div class="lbl">Fuel index</div><div class="val">${effFuelIdx().toFixed(2)}</div><svg viewBox="0 0 180 36" style="width:100%;height:24px"><polyline points="${fpts}" fill="none" stroke="var(--warn)" stroke-width="1.5"/></svg></div>
     </div>
     <div class="card mb" style="position:relative"><h3>30-day P&L</h3>${chart}</div>
+    <div class="card mb"><h3 class="spread"><span>Stock — ${S.code} <b>$${S.stock.price.toFixed(2)}</b></span><span class="sub">sentiment ${S.stock.sentiment.toFixed(2)} · 60 days</span></h3>${(()=>{
+      const h=S.stock.hist; if(h.length<2)return '<p class="sub">Share-price chart appears after 2 days of trading.</p>';
+      const W=1180,H=150,pad=36,mn=Math.min(...h)*0.97,mx=Math.max(...h)*1.03;
+      const x=i=>pad+i/(h.length-1)*(W-pad*2),y=v=>H-18-((v-mn)/(mx-mn||1))*(H-36);
+      const up=h[h.length-1]>=h[0];
+      return `<svg viewBox="0 0 ${W} ${H}" style="width:100%">${[0.5].map(f=>{const v=mn+(mx-mn)*f;return `<line x1="${pad}" x2="${W-pad}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border)" stroke-dasharray="3 4"/><text x="4" y="${y(v)+4}" font-size="10" fill="#5A6B8C">$${v.toFixed(0)}</text>`;}).join("")}
+        <polyline points="${h.map((v,i)=>x(i)+","+y(v)).join(" ")}" fill="none" stroke="${up?"var(--ok)":"var(--bad)"}" stroke-width="2"/></svg>`;})()}</div>
     <div class="grid2">
       <div class="card"><h3>Cost breakdown (30d)</h3>
         <div class="row"><svg viewBox="0 0 120 120" style="width:140px">${donut}</svg>
@@ -1234,10 +1451,18 @@ function renderAch(){
 
 // ---------- Save modal ----------
 function openSaveModal(){
-  openModal(`<h2>Save / Data</h2>
+  openModal(`<h2>Settings & Data</h2>
+    <div class="field"><label><input type="checkbox" id="stSandbox" ${S.sandbox?"checked":""} style="width:auto"> <b>Sandbox: everything unlocked</b> — no level gates on aircraft or hubs</label></div>
+    <div class="field"><label>Event frequency</label>
+      <div class="row">${["Calm","Normal","Chaotic"].map(f=>`<button class="btn sm ${S.settings.freq===f?"primary":""}" data-freq="${f}">${f}</button>`).join("")}</div></div>
+    <div class="field"><label><input type="checkbox" id="stCrashes" ${S.settings.crashes?"checked":""} style="width:auto"> Plane-crash events enabled</label></div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:16px 0">
     <div class="row mb"><button class="btn primary" id="svNow">Save Now</button><button class="btn" id="svExport">Export</button><button class="btn" id="svImport">Import</button><button class="btn danger" id="svReset">Reset Game</button></div>
     <textarea id="svText" rows="8" placeholder="Export puts save JSON here; paste JSON and press Import."></textarea>
     <div class="row" style="margin-top:12px"><button class="btn" onclick="closeModal()">Close</button></div>`);
+  $("#stSandbox").onchange=e=>{S.sandbox=e.target.checked;toast("Sandbox "+(S.sandbox?"on":"off"),S.sandbox?"All aircraft and hub tiers unlocked":"Level gates restored");save();};
+  $$("[data-freq]").forEach(b=>b.onclick=()=>{S.settings.freq=b.dataset.freq;$$("[data-freq]").forEach(x=>x.classList.toggle("primary",x===b));save();});
+  $("#stCrashes").onchange=e=>{S.settings.crashes=e.target.checked;save();};
   $("#svNow").onclick=()=>{save();toast("Saved","Game saved","ok");};
   $("#svExport").onclick=()=>{$("#svText").value=JSON.stringify(S);toast("Exported","Copy the JSON below");};
   $("#svImport").onclick=()=>{
@@ -1253,7 +1478,7 @@ function openSaveModal(){
 }
 
 // ---------- First-run wizard ----------
-const WZ={step:0,name:"",code:"",diff:"Normal",hub:null,hubQ:"",ac:"A220-300",lease:false,base:"#4DA3FF",accent:"#E8EEF9",pattern:"cheatline"};
+const WZ={step:0,name:"",code:"",diff:"Normal",hub:null,hubQ:"",ac:"A220-300",lease:false,sandbox:false,base:"#4DA3FF",accent:"#E8EEF9",pattern:"cheatline"};
 function renderWizard(){
   const w=$("#wizard");
   w.classList.remove("hidden");
@@ -1263,7 +1488,8 @@ function renderWizard(){
       <div class="field"><label>Airline name</label><input type="text" id="wzName" value="${esc(WZ.name)}" maxlength="24" placeholder="e.g. Meridian Air"></div>
       <div class="field"><label>2-letter code</label><input type="text" id="wzCode" value="${esc(WZ.code)}" maxlength="2" style="width:80px;text-transform:uppercase" placeholder="MA"></div>
       <label>Difficulty</label>
-      <div class="row mb">${["Easy","Normal","Hard"].map(d=>`<button class="btn ${WZ.diff===d?"primary":""}" data-d="${d}">${d}<br><span class="sub">${d==="Easy"?"$100M":d==="Normal"?"$50M":"$25M"}</span></button>`).join("")}</div>`;
+      <div class="row mb">${["Easy","Normal","Hard"].map(d=>`<button class="btn ${WZ.diff===d?"primary":""}" data-d="${d}">${d}<br><span class="sub">${d==="Easy"?"$100M":d==="Normal"?"$50M":"$25M"}</span></button>`).join("")}</div>
+      <div class="field"><label><input type="checkbox" id="wzSandbox" ${WZ.sandbox?"checked":""} style="width:auto"> <b>Sandbox: everything unlocked</b> — no level gates on aircraft or hubs (money still required)</label></div>`;
   }else if(WZ.step===1){
     const recs=["SEA","MUC","BKK"];
     const eligible=AIRPORTS.filter(a=>a.tier<=3&&a.rw>=6200);
@@ -1301,6 +1527,7 @@ function renderWizard(){
   if(WZ.step===0){
     $("#wzName").oninput=e=>WZ.name=e.target.value;
     $("#wzCode").oninput=e=>WZ.code=e.target.value.toUpperCase();
+    $("#wzSandbox").onchange=e=>WZ.sandbox=e.target.checked;
     $$("[data-d]").forEach(b=>b.onclick=()=>{WZ.diff=b.dataset.d;renderWizard();});
   }
   if(WZ.step===1){
@@ -1335,7 +1562,11 @@ function startGame(){
   const spec=AC[WZ.ac];
   if(!WZ.lease&&S.cash<spec.price)WZ.lease=true;
   if(WZ.lease)S.cash-=spec.lease/30; else S.cash-=spec.price;
-  S.fleet.push({id:S.nextAcId++,model:WZ.ac,hub:WZ.hub,condition:100,biz:0,prem:0,leased:WZ.lease,inFlight:false,status:"ok",statusUntil:0,hoursToday:0,profitToday:0});
+  S.fleet.push({id:S.nextAcId++,model:WZ.ac,hub:WZ.hub,condition:100,biz:0,prem:0,leased:WZ.lease,inFlight:false,status:"ok",statusUntil:0,hoursToday:0,profitToday:0,refitUntil:0});
+  S.sandbox=WZ.sandbox;
+  S.firstAcId=S.fleet[0].id;
+  S.stock.startNW=Math.max(1e6,netWorth());
+  pushNews("🛫","Airline founded",S.airline+" begins operations from "+WZ.hub+(S.sandbox?" (sandbox mode)":""));
   AIRCRAFT.filter(a=>a.classic).forEach(a=>S.usedRolls[a.model]=Math.round(rand(65,85)));
   $("#wizard").classList.add("hidden");
   bootUI();
@@ -1372,6 +1603,16 @@ function init(){
     if(!S.interline)S.interline={};
     if(S.today.svc===undefined){S.today.svc=0;S.today.interline=0;}
     S.routes.forEach(r=>{if(r.svc===undefined)r.svc=r.type==="pax"?1:0;});
+    // migrate pre-events/stock saves
+    if(S.sandbox===undefined)S.sandbox=false;
+    if(!S.settings)S.settings={freq:"Normal",crashes:true};
+    if(!S.news)S.news=[];
+    if(!S.rivalRemoved)S.rivalRemoved=[];
+    if(!S.rivalOwned)S.rivalOwned={};
+    if(!S.stock){const nw=Math.max(1e6,netWorth());S.stock={price:100,prev:100,sentiment:1,hist:[100],startNW:nw};}
+    if(S.firstAcId===undefined)S.firstAcId=S.fleet.length?Math.min(...S.fleet.map(a=>a.id)):1;
+    Object.assign(S.events,{marketUntil:S.events.marketUntil||0,crashOk:S.events.crashOk||S.day+15,mergerOk:S.events.mergerOk||S.day+20,dipUntil:S.events.dipUntil||0,dipApts:S.events.dipApts||[]});
+    S.fleet.forEach(a=>{if(a.refitUntil===undefined)a.refitUntil=0;});
     S.fleet.forEach(a=>{if(a.inFlight&&!S.flights.some(f=>routeById(f.routeId)&&routeById(f.routeId).acId===a.id))a.inFlight=false;});
     bootUI();
   }else{
